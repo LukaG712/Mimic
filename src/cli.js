@@ -17,7 +17,7 @@ const CLONES_DIR = path.resolve(ROOT, 'clones');
 function showHelp() {
   console.log(`
 ┌─────────────────────────────────────────────────────────────┐
-│  ⚡ GEMINI WEBSTACK — High-Fidelity Website Cloning Suite  │
+│  ⚡ MIMIC — High-Fidelity Website Reverse-Engineering Suite  │
 └─────────────────────────────────────────────────────────────┘
 
 Usage:
@@ -25,7 +25,7 @@ Usage:
 
 Commands:
   clone <url> [name] [--port 3000]     Run full static & font extraction clone
-  capture <url> [name]                 Run headless Chrome CDP runtime capture
+  capture <url> [name] [--port 3000]   Run in-flight CDP stream capture & scaffolding
   serve [name] [--port 3000]           Start hybrid fallback server for cloned site
   verify [name] [--port 3000]          Audit console errors & capture screenshots
   list                                 Show all cloned projects in workspace
@@ -33,7 +33,7 @@ Commands:
 
 Examples:
   node src/cli.js clone https://linear.app linear-clone --port 3001
-  node src/cli.js capture https://stripe.com stripe-runtime
+  node src/cli.js capture https://linear.app linear-runtime --port 3003
   node src/cli.js serve linear-clone
   node src/cli.js verify linear-clone
 `);
@@ -135,14 +135,15 @@ async function main() {
     case 'capture': {
       const targetUrl = positional[0];
       if (!targetUrl) {
-        console.error('❌ Error: Missing URL. Usage: node src/cli.js capture <url> [name]');
+        console.error('❌ Error: Missing URL. Usage: node src/cli.js capture <url> [name] [--port 3000]');
         process.exit(1);
       }
       const customName = positional[1];
       const targetDir = customName ? path.join(CLONES_DIR, customName) : resolveProjectDir(targetUrl);
+      const port = options.port || 3000;
 
       const cdpScript = path.join(__dirname, 'engine', 'cdp_capture.mjs');
-      const proc = spawn('node', [cdpScript, targetUrl, targetDir], { stdio: 'inherit' });
+      const proc = spawn('node', [cdpScript, targetUrl, targetDir, String(port)], { stdio: 'inherit' });
       proc.on('close', (code) => {
         if (code !== 0) process.exit(code);
       });

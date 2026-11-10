@@ -14,7 +14,8 @@
     "capture": "node src/cli.js capture",
     "serve": "node src/cli.js serve",
     "verify": "node src/cli.js verify",
-    "list": "node src/cli.js list"
+    "list": "node src/cli.js list",
+    "test": "node test/url_mapper.test.mjs && node test/turnkey_scaffold.test.mjs && node test/cdp_stream.test.mjs"
   },
   "keywords": [
     "webstack",
