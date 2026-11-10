@@ -1,0 +1,29 @@
+{
+  "name": "mimic",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "High-fidelity automated website cloning, static ingestion, and runtime reverse-engineering stack.",
+  "main": "src/cli.js",
+  "bin": {
+    "mimic": "src/cli.js"
+  },
+  "scripts": {
+    "start": "node src/dashboard.js",
+    "dashboard": "node src/dashboard.js",
+    "clone": "node src/cli.js clone",
+    "capture": "node src/cli.js capture",
+    "serve": "node src/cli.js serve",
+    "verify": "node src/cli.js verify",
+    "list": "node src/cli.js list"
+  },
+  "keywords": [
+    "webstack",
+    "cloning-stack",
+    "reverse-engineering",
+    "cdp-crawler",
+    "nextjs-cloner",
+    "asset-pipeline"
+  ],
+  "author": "Antigravity Engineering",
+  "license": "MIT"
+}
