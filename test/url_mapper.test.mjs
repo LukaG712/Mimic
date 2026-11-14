@@ -1,7 +1,7 @@
 // test/url_mapper.test.mjs
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import { mapUrlToFilePath } from '../src/engine/url_mapper.mjs';
+import { isBlockedTrackerUrl, mapUrlToFilePath, rewriteExternalAssetUrls } from '../src/engine/url_mapper.mjs';
 
 const outDir = path.resolve('C:/clones/test-site');
 const base = 'https://linear.app';
@@ -34,5 +34,18 @@ assert.equal(r4.diskPath, path.join(outDir, 'about.html'));
 const q1 = mapUrlToFilePath('https://linear.app/_next/image?url=img1.png&w=640', base, outDir);
 const q2 = mapUrlToFilePath('https://linear.app/_next/image?url=img2.png&w=1200', base, outDir);
 assert.notEqual(q1.diskPath, q2.diskPath, 'Different queries on extensionless paths must produce distinct filenames');
+
+// Tracker filtering
+assert.equal(isBlockedTrackerUrl('https://www.google-analytics.com/analytics.js'), true);
+assert.equal(isBlockedTrackerUrl('https://linear.app/main.js'), false);
+
+// External CDN URL rewriting
+const sampleHtml = `
+  <link href="https://static.linear.app/fonts/inter.woff2" rel="preload">
+  <a href="https://github.com/org">GitHub</a>
+`;
+const rewritten = rewriteExternalAssetUrls(sampleHtml, new Set(['static.linear.app']));
+assert.ok(rewritten.includes('/external/static.linear.app/fonts/inter.woff2'), 'Captured external CDN must be rewritten');
+assert.ok(rewritten.includes('https://github.com/org'), 'Unlisted third-party links must remain untouched');
 
 console.log('✓ url_mapper tests passed');

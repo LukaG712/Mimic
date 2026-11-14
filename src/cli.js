@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Webstack Master CLI Tool
+ * Mimic Master CLI Tool
  * Fast, elegant terminal command center for website cloning, runtime ingestion, and verification.
  */
 
@@ -24,18 +24,23 @@ Usage:
   node src/cli.js <command> [arguments] [options]
 
 Commands:
-  clone <url> [name] [--port 3000]     Run full static & font extraction clone
+  clone <url> [name] [--port 3000]     Run parallel static & font extraction clone
   capture <url> [name] [--port 3000]   Run in-flight CDP stream capture & scaffolding
   serve [name] [--port 3000]           Start hybrid fallback server for cloned site
-  verify [name] [--port 3000]          Audit console errors & capture screenshots
+  verify [name] [--port 3000]          Audit console errors, layout & capture screenshots
   list                                 Show all cloned projects in workspace
   help                                 Show this guide
 
+Options:
+  --port <num>                         Local server port (default: 3000)
+  --quiet                              Suppress verbose progress output
+  --json                               Emit compact JSON output only
+
 Examples:
   node src/cli.js clone https://linear.app linear-clone --port 3001
-  node src/cli.js capture https://linear.app linear-runtime --port 3003
+  node src/cli.js capture https://linear.app linear-runtime --port 3003 --json
   node src/cli.js serve linear-clone
-  node src/cli.js verify linear-clone
+  node src/cli.js verify linear-clone --json
 `);
 }
 
@@ -90,22 +95,37 @@ async function main() {
 
   switch (command) {
     case 'list': {
-      console.log(`\n📁 Cloned Projects in: ${CLONES_DIR}\n`);
       const items = fs.readdirSync(CLONES_DIR, { withFileTypes: true });
       const dirs = items.filter(d => d.isDirectory());
-      if (dirs.length === 0) {
-        console.log('  (No cloned sites found yet. Run `node src/cli.js clone <url>` to create one!)');
+      const projects = dirs.map(d => {
+        const projPath = path.join(CLONES_DIR, d.name);
+        const pkgPath = path.join(projPath, 'package.json');
+        let description = '';
+        if (fs.existsSync(pkgPath)) {
+          try {
+            const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+            description = pkg.description || '';
+          } catch {}
+        }
+        return {
+          name: d.name,
+          path: projPath,
+          description,
+          hasManifest: fs.existsSync(path.join(projPath, 'clone-manifest.json'))
+        };
+      });
+
+      if (options.json) {
+        console.log(JSON.stringify({ clonesDir: CLONES_DIR, projects }));
+        break;
+      }
+
+      console.log(`\n📁 Cloned Projects in: ${CLONES_DIR}\n`);
+      if (projects.length === 0) {
+        console.log('  (No cloned sites found yet. Run `node src/cli.js capture <url>` to create one!)');
       } else {
-        dirs.forEach((d, idx) => {
-          const pkgPath = path.join(CLONES_DIR, d.name, 'package.json');
-          let desc = '';
-          if (fs.existsSync(pkgPath)) {
-            try {
-              const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
-              desc = pkg.description || '';
-            } catch {}
-          }
-          console.log(`  ${idx + 1}. \x1b[36m${d.name}\x1b[0m ${desc ? `— ${desc}` : ''}`);
+        projects.forEach((p, idx) => {
+          console.log(`  ${idx + 1}. \x1b[36m${p.name}\x1b[0m ${p.description ? `— ${p.description}` : ''}`);
         });
       }
       console.log();
@@ -123,9 +143,11 @@ async function main() {
       const port = options.port || 3000;
 
       const pythonScript = path.join(__dirname, 'engine', 'cloner.py');
-      const proc = spawn('python', [pythonScript, '--url', targetUrl, '--out', targetDir, '--port', String(port)], {
-        stdio: 'inherit'
-      });
+      const pyArgs = [pythonScript, '--url', targetUrl, '--out', targetDir, '--port', String(port)];
+      if (options.quiet) pyArgs.push('--quiet');
+      if (options.json) pyArgs.push('--json');
+
+      const proc = spawn('python', pyArgs, { stdio: 'inherit' });
       proc.on('close', (code) => {
         if (code !== 0) process.exit(code);
       });
@@ -143,7 +165,13 @@ async function main() {
       const port = options.port || 3000;
 
       const cdpScript = path.join(__dirname, 'engine', 'cdp_capture.mjs');
-      const proc = spawn('node', [cdpScript, targetUrl, targetDir, String(port)], { stdio: 'inherit' });
+      const cdpArgs = [cdpScript, targetUrl, targetDir, String(port)];
+      if (options.quiet) cdpArgs.push('--quiet');
+      if (options.json) cdpArgs.push('--json');
+      if (options['no-scroll']) cdpArgs.push('--no-scroll');
+      if (options.timeout) cdpArgs.push('--timeout', String(options.timeout));
+
+      const proc = spawn('node', cdpArgs, { stdio: 'inherit' });
       proc.on('close', (code) => {
         if (code !== 0) process.exit(code);
       });
@@ -154,7 +182,6 @@ async function main() {
       const name = positional[0];
       let targetDir = name ? resolveProjectDir(name) : null;
       if (!targetDir || !fs.existsSync(targetDir)) {
-        // Fallback to first available clone
         const dirs = fs.readdirSync(CLONES_DIR).filter(d => fs.statSync(path.join(CLONES_DIR, d)).isDirectory());
         if (dirs.length > 0) {
           targetDir = path.join(CLONES_DIR, dirs[0]);
@@ -173,7 +200,9 @@ async function main() {
       const env = { ...process.env };
       if (options.port) env.PORT = String(options.port);
 
-      console.log(`Starting server for \x1b[36m${path.basename(targetDir)}\x1b[0m...`);
+      if (!options.quiet) {
+        console.log(`Starting server for \x1b[36m${path.basename(targetDir)}\x1b[0m...`);
+      }
       const proc = spawn('node', ['server.js'], { cwd: targetDir, stdio: 'inherit', env });
       break;
     }
@@ -185,7 +214,12 @@ async function main() {
       const localUrl = options.url || `http://localhost:${port}`;
 
       const verifierScript = path.join(__dirname, 'engine', 'verifier.mjs');
-      const proc = spawn('node', [verifierScript, localUrl, targetDir], { stdio: 'inherit' });
+      const verifyArgs = [verifierScript, localUrl, targetDir];
+      if (options.quiet) verifyArgs.push('--quiet');
+      if (options.json) verifyArgs.push('--json');
+      if (options.timeout) verifyArgs.push('--timeout', String(options.timeout));
+
+      const proc = spawn('node', verifyArgs, { stdio: 'inherit' });
       proc.on('close', (code) => {
         if (code !== 0) process.exit(code);
       });

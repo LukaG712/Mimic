@@ -1,10 +1,69 @@
 /**
  * Asset URL to Local Disk Path Normalizer
- * Accurately maps both same-origin assets and third-party CDNs to clean filesystem paths.
+ * Accurately maps both same-origin assets and third-party CDNs to clean filesystem paths,
+ * filters telemetry/tracker domains, and rewrites external CDN links to local proxy routes.
  */
 
 import crypto from 'crypto';
 import path from 'path';
+
+export const TRACKER_HOSTS = [
+  'google-analytics.com',
+  'googletagmanager.com',
+  'doubleclick.net',
+  'sentry.io',
+  'segment.io',
+  'segment.com',
+  'hotjar.com',
+  'clarity.ms',
+  'intercom.io',
+  'facebook.net',
+  'connect.facebook.net',
+  'bat.bing.com',
+  'mixpanel.com',
+  'amplitude.com',
+  'fullstory.com',
+  'datadoghq.com',
+  'bugsnag.com'
+];
+
+/**
+ * Returns true if the URL belongs to a known analytics, ad, or telemetry tracker domain.
+ *
+ * @param {string} rawUrl
+ * @returns {boolean}
+ */
+export function isBlockedTrackerUrl(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== 'string') return false;
+  try {
+    const parsed = new URL(rawUrl.trim());
+    const host = parsed.hostname.toLowerCase();
+    return TRACKER_HOSTS.some(t => host === t || host.endsWith('.' + t));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Rewrites captured external origin URLs inside HTML or CSS text to local /external/<host>/ paths.
+ *
+ * @param {string} text
+ * @param {Iterable<string>} capturedExternalHosts
+ * @returns {string}
+ */
+export function rewriteExternalAssetUrls(text, capturedExternalHosts) {
+  if (!text || !capturedExternalHosts) return text;
+
+  let output = text;
+  for (const host of capturedExternalHosts) {
+    if (!host) continue;
+    const safeHost = host.replace(/[\\:*?"<>|]/g, '_');
+    const escapedHost = host.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const pattern = new RegExp(`(?:https?:\\/\\/|(?<![:/])\\/\\/)${escapedHost}\\/`, 'g');
+    output = output.replace(pattern, `/external/${safeHost}/`);
+  }
+  return output;
+}
 
 /**
  * Maps an incoming network asset URL to a sanitized local disk path.

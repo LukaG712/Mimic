@@ -1,20 +1,42 @@
 /**
- * Webstack Chrome DevTools Protocol (CDP) In-Flight Stream Capture Engine
+ * Mimic Chrome DevTools Protocol (CDP) In-Flight Stream Capture Engine
  * Captures fully hydrated client-side SPAs, streams network assets in-flight directly
- * from browser memory to disk, and takes high-resolution viewport screenshots.
+ * from browser memory to disk via async I/O, rewrites external CDNs, emits a compact
+ * clone-manifest.json, and captures viewport screenshots.
  */
 
 import { spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { mapUrlToFilePath } from './url_mapper.mjs';
+import { isBlockedTrackerUrl, mapUrlToFilePath, rewriteExternalAssetUrls } from './url_mapper.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const CHROME_PATH = process.env.CHROME_PATH || 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
 const MAX_CONCURRENCY = 10;
 const COMMAND_TIMEOUT_MS = 15000;
+
+/**
+ * Polls Chrome's remote debugging endpoint until ready instead of sleeping a fixed duration.
+ */
+export async function waitForChromeReady(port, maxWaitMs = 5000, isAborted = () => false) {
+  const deadline = Date.now() + maxWaitMs;
+  let lastErr;
+  while (Date.now() < deadline && !isAborted()) {
+    try {
+      const resp = await fetch(`http://127.0.0.1:${port}/json/version`);
+      if (resp.ok) {
+        return await resp.json();
+      }
+    } catch (err) {
+      lastErr = err;
+    }
+    await new Promise(r => setTimeout(r, 80));
+  }
+  if (isAborted()) return null;
+  throw new Error(`Chrome debug endpoint on port ${port} did not become ready within ${maxWaitMs}ms${lastErr ? `: ${lastErr.message}` : ''}`);
+}
 
 export async function captureRuntime(targetUrl, outputDir, options = {}) {
   const width = options.width || 1440;
@@ -24,12 +46,15 @@ export async function captureRuntime(targetUrl, outputDir, options = {}) {
   const doScroll = options.scroll !== false;
   const targetPort = options.targetPort || 3000;
   const timeoutMs = options.timeout || 60000;
+  const log = (...args) => {
+    if (!options.quiet && !options.json) console.log(...args);
+  };
 
-  console.log(`\n=======================================================`);
-  console.log(`🤖 [Mimic CDP In-Flight Engine] Navigating: ${targetUrl}`);
-  console.log(`📁 Destination: ${outputDir}`);
-  console.log(`🔌 Chrome Debug Port: ${port}`);
-  console.log(`=======================================================\n`);
+  log(`\n=======================================================`);
+  log(`🤖 [Mimic CDP In-Flight Engine] Navigating: ${targetUrl}`);
+  log(`📁 Destination: ${outputDir}`);
+  log(`🔌 Chrome Debug Port: ${port}`);
+  log(`=======================================================\n`);
 
   if (!fs.existsSync(CHROME_PATH)) {
     throw new Error(`Chrome executable not found at: ${CHROME_PATH}`);
@@ -54,16 +79,18 @@ export async function captureRuntime(targetUrl, outputDir, options = {}) {
 
   const runCapture = async () => {
     let assetCount = 0;
+    let skippedTrackers = 0;
     let totalBytes = 0;
     let domBytes = 0;
     let screenshotBytes = 0;
+    const capturedExternalHosts = new Set();
+    const cssDiskPaths = new Set();
+    const createdDirs = new Map();
+    const mimeBreakdown = {};
 
-    await new Promise(r => setTimeout(r, 1500));
-    if (aborted) return;
+    const versionData = await waitForChromeReady(port, 5000, () => aborted);
+    if (aborted || !versionData) return;
 
-    const versionResp = await fetch(`http://127.0.0.1:${port}/json/version`);
-    if (aborted) return;
-    const versionData = await versionResp.json();
     ws = new WebSocket(versionData.webSocketDebuggerUrl);
     await new Promise((resolve, reject) => {
       ws.onopen = resolve;
@@ -74,10 +101,19 @@ export async function captureRuntime(targetUrl, outputDir, options = {}) {
     let msgId = 1;
     let activeSessionId = null;
     const pendingResponses = new Map();
+    const inflightRequests = new Set();
+    let lastNetworkActivity = Date.now();
     const taskQueue = [];
     let activeWorkers = 0;
     let totalQueued = 0;
-    let drainResolvers = [];
+    const drainResolvers = [];
+
+    function ensureDir(dirPath) {
+      if (!createdDirs.has(dirPath)) {
+        createdDirs.set(dirPath, fs.promises.mkdir(dirPath, { recursive: true }));
+      }
+      return createdDirs.get(dirPath);
+    }
 
     function pumpQueue() {
       while (activeWorkers < MAX_CONCURRENCY && taskQueue.length > 0) {
@@ -105,6 +141,17 @@ export async function captureRuntime(targetUrl, outputDir, options = {}) {
         new Promise(resolve => drainResolvers.push(resolve)),
         new Promise(resolve => setTimeout(resolve, maxWaitMs))
       ]);
+    }
+
+    async function waitForNetworkIdle(maxWaitMs = 3500, idleWindowMs = 500) {
+      const start = Date.now();
+      await new Promise(r => setTimeout(r, Math.min(300, maxWaitMs)));
+      while (!aborted && Date.now() - start < maxWaitMs) {
+        if (inflightRequests.size === 0 && Date.now() - lastNetworkActivity >= idleWindowMs) {
+          return;
+        }
+        await new Promise(r => setTimeout(r, 100));
+      }
     }
 
     function sendCommand(method, params = {}, sessionId = undefined) {
@@ -158,10 +205,21 @@ export async function captureRuntime(targetUrl, outputDir, options = {}) {
 
       if (!activeSessionId || data.sessionId !== activeSessionId) return;
 
-      if (data.method === 'Network.responseReceived') {
+      if (data.method === 'Network.requestWillBeSent') {
+        const reqUrl = data.params?.request?.url;
+        if (reqUrl && !reqUrl.startsWith('data:') && !reqUrl.startsWith('blob:') && !isBlockedTrackerUrl(reqUrl)) {
+          inflightRequests.add(data.params.requestId);
+          lastNetworkActivity = Date.now();
+        }
+      } else if (data.method === 'Network.responseReceived') {
         const { requestId, response } = data.params;
+        const assetUrl = response?.url;
+        if (isBlockedTrackerUrl(assetUrl)) {
+          skippedTrackers++;
+          inflightRequests.delete(requestId);
+          return;
+        }
         if (response && (response.status === 200 || response.status === 206)) {
-          const assetUrl = response.url;
           if (assetUrl && !assetUrl.startsWith('data:') && !assetUrl.startsWith('blob:')) {
             pendingResponses.set(requestId, {
               url: assetUrl,
@@ -173,8 +231,12 @@ export async function captureRuntime(targetUrl, outputDir, options = {}) {
       } else if (data.method === 'Network.loadingFailed') {
         const { requestId } = data.params;
         pendingResponses.delete(requestId);
+        inflightRequests.delete(requestId);
+        lastNetworkActivity = Date.now();
       } else if (data.method === 'Network.loadingFinished') {
         const { requestId } = data.params;
+        inflightRequests.delete(requestId);
+        lastNetworkActivity = Date.now();
         const info = pendingResponses.get(requestId);
         if (info) {
           pendingResponses.delete(requestId);
@@ -188,13 +250,29 @@ export async function captureRuntime(targetUrl, outputDir, options = {}) {
                   const buf = bodyRes.base64Encoded
                     ? Buffer.from(bodyRes.body, 'base64')
                     : Buffer.from(bodyRes.body, 'utf-8');
-                  fs.mkdirSync(path.dirname(mapped.diskPath), { recursive: true });
-                  fs.writeFileSync(mapped.diskPath, buf);
+                  await ensureDir(path.dirname(mapped.diskPath));
+                  await fs.promises.writeFile(mapped.diskPath, buf);
+
+                  if (mapped.isExternal) {
+                    try {
+                      capturedExternalHosts.add(new URL(info.url, targetUrl).hostname);
+                    } catch {}
+                  }
+
+                  const cleanMime = (info.mimeType || 'application/octet-stream').split(';')[0].trim().toLowerCase();
+                  if (!mimeBreakdown[cleanMime]) mimeBreakdown[cleanMime] = { count: 0, bytes: 0 };
+                  mimeBreakdown[cleanMime].count++;
+                  mimeBreakdown[cleanMime].bytes += buf.length;
+
+                  if (cleanMime.includes('text/css') || mapped.diskPath.endsWith('.css')) {
+                    cssDiskPaths.add(mapped.diskPath);
+                  }
+
                   assetCount++;
                   totalBytes += buf.length;
                   const rel = path.relative(outputDir, mapped.diskPath);
                   if (assetCount <= 15 || assetCount % 20 === 0) {
-                    console.log(`  ✓ [In-Flight Stream] ${info.mimeType} -> ${rel} (${buf.length.toLocaleString()} B)`);
+                    log(`  ✓ [In-Flight Stream] ${info.mimeType} -> ${rel} (${buf.length.toLocaleString()} B)`);
                   }
                 }
               }
@@ -231,15 +309,15 @@ export async function captureRuntime(targetUrl, outputDir, options = {}) {
       mobile: false
     });
 
-    console.log(`▶ Navigating to ${targetUrl}...`);
+    log(`▶ Navigating to ${targetUrl}...`);
     await sendSession('Page.navigate', { url: targetUrl });
 
-    // Wait for initial load
-    await new Promise(r => setTimeout(r, waitMs));
+    // Wait for network idle rather than blind sleep
+    await waitForNetworkIdle(waitMs, 500);
 
     // Scroll smoothly to trigger lazy elements if requested
     if (doScroll) {
-      console.log(`▶ Triggering lazy-load elements via viewport scroll...`);
+      log(`▶ Triggering lazy-load elements via viewport scroll...`);
       await sendSession('Runtime.evaluate', {
         expression: `
           new Promise((resolve) => {
@@ -266,33 +344,130 @@ export async function captureRuntime(targetUrl, outputDir, options = {}) {
         `,
         awaitPromise: true
       });
-      await new Promise(r => setTimeout(r, 1500));
+      await waitForNetworkIdle(1500, 400);
     }
 
     // Await bounded queue drain
-    console.log(`▶ Finalizing in-flight stream downloads (${totalQueued} assets queued)...`);
+    log(`▶ Finalizing in-flight stream downloads (${totalQueued} assets queued)...`);
     await waitForQueueDrain(15000);
 
-    // Extract hydrated HTML and preserve DOCTYPE to avoid Quirks Mode
-    console.log(`▶ Extracting hydrated DOM...`);
-    const domResult = await sendSession('Runtime.evaluate', {
-      expression: 'document.documentElement.outerHTML',
+    // Freeze lazy attributes/canvases and gather compact manifest metadata in one browser call
+    log(`▶ Freezing dynamic media & extracting hydrated DOM...`);
+    const prepResult = await sendSession('Runtime.evaluate', {
+      expression: `(() => {
+        try {
+          document.querySelectorAll('img[loading="lazy"], iframe[loading="lazy"]').forEach(el => {
+            el.setAttribute('loading', 'eager');
+          });
+          document.querySelectorAll('img, source').forEach(el => {
+            const curSrc = el.getAttribute('src') || '';
+            const dataSrc = el.getAttribute('data-src');
+            if (dataSrc && (!curSrc || curSrc.startsWith('data:image/gif') || curSrc.startsWith('data:image/svg'))) {
+              el.setAttribute('src', dataSrc);
+            }
+            const curSrcset = el.getAttribute('srcset') || '';
+            const dataSrcset = el.getAttribute('data-srcset');
+            if (dataSrcset && !curSrcset) {
+              el.setAttribute('srcset', dataSrcset);
+            }
+          });
+          document.querySelectorAll('canvas').forEach(canvas => {
+            try {
+              if (canvas.width > 0 && canvas.height > 0) {
+                const dataUrl = canvas.toDataURL('image/png');
+                if (dataUrl && dataUrl.length < 200000) {
+                  canvas.style.backgroundImage = 'url(' + dataUrl + ')';
+                  canvas.style.backgroundSize = 'contain';
+                  canvas.style.backgroundRepeat = 'no-repeat';
+                }
+              }
+            } catch {}
+          });
+
+          const fonts = new Set();
+          const colors = new Set();
+          document.querySelectorAll('body, h1, h2, h3, p, a, header').forEach(el => {
+            const st = getComputedStyle(el);
+            if (st.fontFamily && fonts.size < 10) fonts.add(st.fontFamily);
+            if (st.color && colors.size < 12) colors.add(st.color);
+            if (st.backgroundColor && st.backgroundColor !== 'rgba(0, 0, 0, 0)' && colors.size < 12) {
+              colors.add(st.backgroundColor);
+            }
+          });
+
+          const cssVariables = {};
+          const rootStyle = getComputedStyle(document.documentElement);
+          for (let i = 0; i < rootStyle.length && Object.keys(cssVariables).length < 30; i++) {
+            const prop = rootStyle[i];
+            if (prop && prop.startsWith('--')) {
+              const val = rootStyle.getPropertyValue(prop).trim();
+              if (val && val.length <= 80) cssVariables[prop] = val;
+            }
+          }
+
+          const landmarks = [];
+          document.querySelectorAll('header, nav, main, section, footer').forEach(el => {
+            if (landmarks.length >= 15) return;
+            const headings = Array.from(el.querySelectorAll('h1, h2, h3'))
+              .slice(0, 3)
+              .map(h => (h.textContent || '').trim().slice(0, 80))
+              .filter(Boolean);
+            landmarks.push({
+              tag: el.tagName.toLowerCase(),
+              id: el.id || undefined,
+              classes: typeof el.className === 'string' ? el.className.trim().split(/\\s+/).slice(0, 4).join(' ') || undefined : undefined,
+              headings: headings.length ? headings : undefined
+            });
+          });
+
+          const metaDesc = document.querySelector('meta[name="description"]');
+          return {
+            html: document.documentElement.outerHTML,
+            page: {
+              title: document.title || '',
+              description: metaDesc ? (metaDesc.getAttribute('content') || '').slice(0, 200) : '',
+              lang: document.documentElement.lang || '',
+              fonts: Array.from(fonts),
+              colors: Array.from(colors),
+              cssVariables,
+              landmarks
+            }
+          };
+        } catch (err) {
+          return { html: document.documentElement ? document.documentElement.outerHTML : '', page: {} };
+        }
+      })()`,
       returnByValue: true
     });
 
-    if (domResult && domResult.result && domResult.result.value) {
-      let html = domResult.result.value;
+    const extracted = prepResult?.result?.value || {};
+    if (extracted.html) {
+      let html = extracted.html;
       if (!html.trim().toLowerCase().startsWith('<!doctype')) {
         html = '<!DOCTYPE html>\n' + html;
       }
+      html = rewriteExternalAssetUrls(html, capturedExternalHosts);
       const htmlPath = path.join(outputDir, 'index.html');
-      fs.writeFileSync(htmlPath, html, 'utf-8');
+      await fs.promises.writeFile(htmlPath, html, 'utf-8');
       domBytes = Buffer.byteLength(html, 'utf-8');
-      console.log(`  ✓ Saved hydrated DOM to index.html (${domBytes.toLocaleString()} bytes)`);
+      log(`  ✓ Saved hydrated DOM to index.html (${domBytes.toLocaleString()} bytes)`);
+    }
+
+    // Rewrite external CDN references in downloaded CSS files
+    if (capturedExternalHosts.size > 0 && cssDiskPaths.size > 0) {
+      for (const cssPath of cssDiskPaths) {
+        try {
+          const cssText = await fs.promises.readFile(cssPath, 'utf-8');
+          const rewritten = rewriteExternalAssetUrls(cssText, capturedExternalHosts);
+          if (rewritten !== cssText) {
+            await fs.promises.writeFile(cssPath, rewritten, 'utf-8');
+          }
+        } catch {}
+      }
     }
 
     // Capture screenshot
-    console.log(`▶ Capturing high-resolution viewport screenshot...`);
+    log(`▶ Capturing high-resolution viewport screenshot...`);
     const screenshot = await sendSession('Page.captureScreenshot', {
       format: 'png',
       captureBeyondViewport: false
@@ -300,24 +475,45 @@ export async function captureRuntime(targetUrl, outputDir, options = {}) {
 
     const screenshotPath = path.join(outputDir, 'screenshot.png');
     const shotBuf = Buffer.from(screenshot.data, 'base64');
-    fs.writeFileSync(screenshotPath, shotBuf);
+    await fs.promises.writeFile(screenshotPath, shotBuf);
     screenshotBytes = shotBuf.length;
-    console.log(`  ✓ Saved screenshot to screenshot.png (${screenshotBytes.toLocaleString()} bytes)`);
+    log(`  ✓ Saved screenshot to screenshot.png (${screenshotBytes.toLocaleString()} bytes)`);
 
     // Scaffold standalone clone server and manifests
     scaffoldCloneManifests(targetUrl, outputDir, targetPort);
 
-    console.log(`\n=======================================================`);
-    console.log(`🎉 In-Flight Stream Capture Complete!`);
-    console.log(`📊 Intercepted Assets: ${assetCount} (${(totalBytes / 1024).toFixed(1)} KB)`);
-    console.log(`📁 Saved in: ${outputDir}`);
-    console.log(`=======================================================\n`);
+    // Emit compact clone-manifest.json for token-efficient AI inspection
+    const manifest = {
+      url: targetUrl,
+      capturedAt: new Date().toISOString(),
+      domBytes,
+      screenshotBytes,
+      assetCount,
+      skippedTrackers,
+      totalBytes,
+      externalHosts: [...capturedExternalHosts],
+      mimeBreakdown,
+      page: extracted.page || {}
+    };
+    await fs.promises.writeFile(
+      path.join(outputDir, 'clone-manifest.json'),
+      JSON.stringify(manifest, null, 2),
+      'utf-8'
+    );
+
+    log(`\n=======================================================`);
+    log(`🎉 In-Flight Stream Capture Complete!`);
+    log(`📊 Intercepted Assets: ${assetCount} (${(totalBytes / 1024).toFixed(1)} KB) | Skipped Trackers: ${skippedTrackers}`);
+    log(`📁 Saved in: ${outputDir}`);
+    log(`=======================================================\n`);
 
     return {
       domBytes,
       screenshotBytes,
       assetCount,
-      totalBytes
+      skippedTrackers,
+      totalBytes,
+      externalHosts: [...capturedExternalHosts]
     };
   };
 
@@ -334,7 +530,9 @@ export async function captureRuntime(targetUrl, outputDir, options = {}) {
 
     return await Promise.race([capturePromise, timeoutPromise]);
   } catch (err) {
-    console.error(`❌ CDP Capture Error: ${err.message}`);
+    if (!options.quiet && !options.json) {
+      console.error(`❌ CDP Capture Error: ${err.message}`);
+    }
     throw err;
   } finally {
     aborted = true;
@@ -356,7 +554,8 @@ export async function captureRuntime(targetUrl, outputDir, options = {}) {
  */
 export function scaffoldCloneManifests(targetUrl, outputDir, port = 3000) {
   const origin = new URL(targetUrl).origin;
-  const slug = path.basename(outputDir);
+  const rawSlug = path.basename(outputDir);
+  const safeName = rawSlug.toLowerCase().replace(/[^a-z0-9-_]/g, '-').replace(/^-+|-+$/g, '') || 'cloned-site';
 
   const templatePath = path.resolve(__dirname, '..', 'server', 'proxy_server.template.js');
   let serverCode = '';
@@ -380,7 +579,7 @@ server.listen(${port}, () => console.log('Listening on http://localhost:${port}'
   fs.writeFileSync(path.join(outputDir, 'server.js'), serverCode, 'utf8');
 
   const packageJson = {
-    name: slug,
+    name: safeName,
     version: '1.0.0',
     description: `High-fidelity 1:1 clone of ${targetUrl} captured via Mimic In-Flight Engine.`,
     main: 'server.js',
@@ -395,7 +594,7 @@ server.listen(${port}, () => console.log('Listening on http://localhost:${port}'
 
   fs.writeFileSync(path.join(outputDir, 'package.json'), JSON.stringify(packageJson, null, 2), 'utf8');
 
-  const readmeMd = `# ${slug} — 1:1 In-Flight Clone
+  const readmeMd = `# ${safeName} — 1:1 In-Flight Clone
 
 Autonomous 1:1 reproduction of [${targetUrl}](${targetUrl}) captured with **Mimic In-Flight Stream Engine**.
 
@@ -410,7 +609,7 @@ Available locally at: **[http://localhost:${port}](http://localhost:${port})**
 
 ## 🛡️ Autonomous Fallback Proxy
 - All assets intercepted during Chrome runtime streaming are served statically from disk.
-- Any dynamic misses or upstream requests are fetched on demand from \`${origin}\`, served with CORS headers, and cached permanently on disk.
+- Any dynamic misses or upstream requests are fetched on demand from \`${origin}\` (or \`/external/<host>/\`), served with CORS headers, and cached permanently on disk.
 `;
 
   fs.writeFileSync(path.join(outputDir, 'README.md'), readmeMd, 'utf8');
@@ -418,12 +617,45 @@ Available locally at: **[http://localhost:${port}](http://localhost:${port})**
 
 // CLI invoker
 if (process.argv[1] && process.argv[1].endsWith('cdp_capture.mjs')) {
-  const urlArg = process.argv[2];
-  const outArg = process.argv[3] || './clones/captured-site';
-  const portArg = parseInt(process.argv[4] || '3000', 10);
+  const rawArgs = process.argv.slice(2);
+  const positional = [];
+  const flags = {};
+  for (let i = 0; i < rawArgs.length; i++) {
+    const a = rawArgs[i];
+    if (a.startsWith('--')) {
+      const k = a.slice(2);
+      const next = rawArgs[i + 1];
+      if (next && !next.startsWith('--')) {
+        flags[k] = next;
+        i++;
+      } else {
+        flags[k] = true;
+      }
+    } else {
+      positional.push(a);
+    }
+  }
+
+  const urlArg = positional[0];
+  const outArg = positional[1] || './clones/captured-site';
+  const portArg = parseInt(flags.port || positional[2] || '3000', 10);
   if (!urlArg) {
-    console.log('Usage: node cdp_capture.mjs <url> [outputDir] [port]');
+    console.log('Usage: node cdp_capture.mjs <url> [outputDir] [port] [--quiet] [--json] [--no-scroll] [--timeout 60000]');
     process.exit(1);
   }
-  captureRuntime(urlArg, path.resolve(outArg), { targetPort: portArg });
+
+  captureRuntime(urlArg, path.resolve(outArg), {
+    targetPort: portArg,
+    quiet: Boolean(flags.quiet),
+    json: Boolean(flags.json),
+    scroll: flags['no-scroll'] ? false : true,
+    timeout: flags.timeout ? parseInt(flags.timeout, 10) : undefined
+  })
+    .then((res) => {
+      if (flags.json) console.log(JSON.stringify(res));
+    })
+    .catch((err) => {
+      if (flags.json) console.log(JSON.stringify({ error: err.message }));
+      process.exit(1);
+    });
 }

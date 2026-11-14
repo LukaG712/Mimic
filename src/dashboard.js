@@ -1,5 +1,5 @@
 /**
- * Webstack Visual Management Studio & Dashboard
+ * Mimic Visual Management Studio & Dashboard
  * Runs on http://localhost:4000
  */
 
@@ -17,11 +17,12 @@ const CLONES_DIR = path.resolve(ROOT, 'clones');
 const LEGACY_CLONES_DIR = 'C:\\Users\\gosse\\Documents\\Gemini\\Clones';
 
 const PORT = 4000;
+const activeServers = new Map();
 
 function getAllClones() {
   const list = [];
   const dirsToScan = [
-    { base: CLONES_DIR, tag: 'Webstack' },
+    { base: CLONES_DIR, tag: 'Mimic' },
     { base: LEGACY_CLONES_DIR, tag: 'Gemini' }
   ];
 
@@ -50,6 +51,7 @@ function getAllClones() {
               } catch {}
             }
             const hasScreenshot = fs.existsSync(path.join(projectPath, 'screenshot.png'));
+            const hasManifest = fs.existsSync(path.join(projectPath, 'clone-manifest.json'));
 
             list.push({
               name: e.name,
@@ -57,7 +59,9 @@ function getAllClones() {
               source: tag,
               description,
               port,
-              hasScreenshot
+              hasScreenshot,
+              hasManifest,
+              running: activeServers.has(e.name)
             });
           }
         }
@@ -69,9 +73,22 @@ function getAllClones() {
   return list;
 }
 
-const activeServers = new Map();
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', chunk => body += chunk);
+    req.on('end', () => {
+      try {
+        resolve(body ? JSON.parse(body) : {});
+      } catch (err) {
+        reject(err);
+      }
+    });
+    req.on('error', reject);
+  });
+}
 
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
   const parsed = url.parse(req.url, true);
 
   if (parsed.pathname === '/api/clones') {
@@ -81,35 +98,99 @@ const server = http.createServer((req, res) => {
   }
 
   if (parsed.pathname === '/api/clone' && req.method === 'POST') {
-    let body = '';
-    req.on('data', chunk => body += chunk);
-    req.on('end', () => {
-      try {
-        const { targetUrl, name, port } = JSON.parse(body);
-        if (!targetUrl) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Missing targetUrl' }));
-          return;
-        }
-
-        const slug = name || targetUrl.replace(/^https?:\/\//, '').replace(/[^a-zA-Z0-9]/g, '-') + '-clone';
-        const targetDir = path.join(CLONES_DIR, slug);
-        const assignedPort = port || (3010 + Math.floor(Math.random() * 80));
-
-        const pythonScript = path.join(__dirname, 'engine', 'cloner.py');
-        const child = spawn('python', [pythonScript, '--url', targetUrl, '--out', targetDir, '--port', String(assignedPort)]);
-
-        child.on('close', (code) => {
-          console.log(`Cloning finished with code ${code}`);
-        });
-
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, slug, targetDir, port: assignedPort }));
-      } catch (err) {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: err.message }));
+    try {
+      const { targetUrl, name, port, engine = 'cdp' } = await readJsonBody(req);
+      if (!targetUrl) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Missing targetUrl' }));
+        return;
       }
-    });
+
+      const slug = (name || targetUrl.replace(/^https?:\/\//, '').replace(/[^a-zA-Z0-9]/g, '-') + '-clone')
+        .toLowerCase()
+        .replace(/[^a-z0-9-_]/g, '-');
+      const targetDir = path.join(CLONES_DIR, slug);
+      const assignedPort = port || (3010 + Math.floor(Math.random() * 80));
+
+      let child;
+      if (engine === 'static') {
+        const pythonScript = path.join(__dirname, 'engine', 'cloner.py');
+        child = spawn('python', [pythonScript, '--url', targetUrl, '--out', targetDir, '--port', String(assignedPort)], {
+          stdio: 'inherit'
+        });
+      } else {
+        const cdpScript = path.join(__dirname, 'engine', 'cdp_capture.mjs');
+        child = spawn('node', [cdpScript, targetUrl, targetDir, String(assignedPort)], {
+          stdio: 'inherit'
+        });
+      }
+
+      child.on('close', (code) => {
+        console.log(`Cloning (${engine}) finished for ${slug} with code ${code}`);
+      });
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, slug, targetDir, port: assignedPort, engine }));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  if (parsed.pathname === '/api/serve' && req.method === 'POST') {
+    try {
+      const { name, action = 'start' } = await readJsonBody(req);
+      const clones = getAllClones();
+      const match = clones.find(c => c.name === name);
+
+      if (!match) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: `Clone "${name}" not found` }));
+        return;
+      }
+
+      if (action === 'stop') {
+        const proc = activeServers.get(match.name);
+        if (proc) {
+          try { proc.kill(); } catch {}
+          activeServers.delete(match.name);
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, name: match.name, running: false }));
+        return;
+      }
+
+      if (activeServers.has(match.name)) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, name: match.name, running: true, port: match.port }));
+        return;
+      }
+
+      const serverPath = path.join(match.path, 'server.js');
+      if (!fs.existsSync(serverPath)) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: `server.js missing in ${match.path}` }));
+        return;
+      }
+
+      const child = spawn('node', ['server.js'], {
+        cwd: match.path,
+        env: { ...process.env, PORT: String(match.port) },
+        stdio: 'ignore'
+      });
+
+      activeServers.set(match.name, child);
+      child.on('exit', () => {
+        activeServers.delete(match.name);
+      });
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, name: match.name, running: true, port: match.port }));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
     return;
   }
 
@@ -136,7 +217,7 @@ const server = http.createServer((req, res) => {
 <html lang="en" class="dark">
 <head>
   <meta charset="UTF-8">
-  <title>Gemini Webstack — Architecture & Cloning Studio</title>
+  <title>Mimic Studio — Reverse-Engineering & Cloning Suite</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
@@ -150,17 +231,16 @@ const server = http.createServer((req, res) => {
     <!-- Header -->
     <header class="border-b border-white/10 px-8 py-5 flex items-center justify-between bg-stone-950/80 backdrop-blur sticky top-0 z-40">
       <div class="flex items-center gap-3">
-        <div class="size-8 rounded-lg bg-amber-400 text-stone-950 font-bold flex items-center justify-center text-sm">W</div>
+        <div class="size-8 rounded-lg bg-amber-400 text-stone-950 font-bold flex items-center justify-center text-sm">M</div>
         <div>
-          <span class="font-editorial text-2xl text-white">Gemini Webstack</span>
-          <span class="text-xs text-stone-400 ml-2 font-mono">v1.0.0</span>
+          <span class="font-editorial text-2xl text-white">Mimic Studio</span>
+          <span class="text-xs text-stone-400 ml-2 font-mono">v1.1.0</span>
         </div>
       </div>
       <div class="flex items-center gap-4 text-xs">
         <span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full border border-emerald-500/20 bg-emerald-500/10 text-emerald-400">
-          <span class="size-1.5 rounded-full bg-emerald-400"></span> Engine Online
+          <span class="size-1.5 rounded-full bg-emerald-400"></span> In-Flight CDP Ready
         </span>
-        <a href="https://github.com" target="_blank" class="text-stone-400 hover:text-white transition">Documentation</a>
       </div>
     </header>
 
@@ -172,11 +252,11 @@ const server = http.createServer((req, res) => {
           High-Fidelity Reverse-Engineering & Cloning Engine
         </h1>
         <p class="text-sm text-stone-400 mt-2 max-w-2xl leading-relaxed">
-          Ingest any production URL, extract embedded Webfonts, client React bundles, and responsive media with automated fallback proxy scaffolding.
+          Ingest any production URL via real-time CDP stream interception or parallel static crawling with automated multi-CDN proxy scaffolding.
         </p>
 
         <form id="cloneForm" class="mt-8 grid grid-cols-1 sm:grid-cols-12 gap-3" onsubmit="triggerClone(event)">
-          <div class="sm:col-span-6">
+          <div class="sm:col-span-5">
             <input 
               id="urlInput"
               type="url" 
@@ -185,13 +265,22 @@ const server = http.createServer((req, res) => {
               class="w-full px-4 py-3 rounded-xl bg-black/60 border border-white/10 text-white placeholder-stone-500 text-sm focus:outline-none focus:border-amber-400"
             />
           </div>
-          <div class="sm:col-span-3">
+          <div class="sm:col-span-2">
             <input 
               id="nameInput"
               type="text" 
-              placeholder="custom-slug (optional)" 
+              placeholder="slug (optional)" 
               class="w-full px-4 py-3 rounded-xl bg-black/60 border border-white/10 text-white placeholder-stone-500 text-sm focus:outline-none focus:border-amber-400"
             />
+          </div>
+          <div class="sm:col-span-2">
+            <select
+              id="engineSelect"
+              class="w-full px-3 py-3 rounded-xl bg-black/60 border border-white/10 text-white text-sm focus:outline-none focus:border-amber-400"
+            >
+              <option value="cdp">In-Flight CDP</option>
+              <option value="static">Static Python</option>
+            </select>
           </div>
           <div class="sm:col-span-3">
             <button 
@@ -222,7 +311,7 @@ const server = http.createServer((req, res) => {
   </div>
 
   <footer class="border-t border-white/10 py-6 text-center text-xs text-stone-400 font-mono">
-    Gemini Webstack Suite • Antwerp / Local Development
+    Mimic Studio • Local Reverse-Engineering Suite
   </footer>
 
   <script>
@@ -235,18 +324,29 @@ const server = http.createServer((req, res) => {
         count.textContent = data.clones.length + ' clones detected';
 
         grid.innerHTML = data.clones.map(c => \`
-          <div class="rounded-2xl border border-white/10 bg-stone-900/40 p-5 flex flex-col justify-between hover:border-white/20 transition group">
+          <div class="rounded-2xl border border-white/10 bg-stone-900/40 overflow-hidden flex flex-col justify-between hover:border-white/20 transition group">
             <div>
-              <div class="flex items-center justify-between text-xs text-stone-400 mb-2">
-                <span class="px-2 py-0.5 rounded bg-white/5 border border-white/10 font-mono text-[10px]">\${c.source}</span>
-                <span class="font-mono text-amber-400">Port :\${c.port}</span>
+              \${c.hasScreenshot ? \`<img src="/screenshot/\${encodeURIComponent(c.name)}" alt="\${c.name}" class="w-full h-36 object-cover border-b border-white/10 bg-black/40" loading="lazy" />\` : ''}
+              <div class="p-5 pb-3">
+                <div class="flex items-center justify-between text-xs text-stone-400 mb-2">
+                  <div class="flex items-center gap-1.5">
+                    <span class="px-2 py-0.5 rounded bg-white/5 border border-white/10 font-mono text-[10px]">\${c.source}</span>
+                    \${c.running ? '<span class="px-2 py-0.5 rounded bg-emerald-500/15 border border-emerald-500/30 text-emerald-400 font-mono text-[10px]">LIVE</span>' : ''}
+                  </div>
+                  <span class="font-mono text-amber-400">Port :\${c.port}</span>
+                </div>
+                <h3 class="text-base font-semibold text-white tracking-tight group-hover:text-amber-300 transition">\${c.name}</h3>
+                <p class="text-xs text-stone-400 mt-1 line-clamp-2 leading-relaxed">\${c.description || 'Full 1:1 reconstruction with autonomous proxy fallback.'}</p>
               </div>
-              <h3 class="text-base font-semibold text-white tracking-tight group-hover:text-amber-300 transition">\${c.name}</h3>
-              <p class="text-xs text-stone-400 mt-1 line-clamp-2 leading-relaxed">\${c.description || 'Full 1:1 reconstruction with autonomous proxy fallback.'}</p>
             </div>
 
-            <div class="mt-4 pt-3 border-t border-white/5 flex items-center justify-between text-xs">
-              <span class="font-mono text-[10px] text-stone-400 truncate max-w-[160px]">\${c.path}</span>
+            <div class="px-5 py-3 border-t border-white/5 flex items-center justify-between gap-2 text-xs">
+              <button
+                onclick="toggleServer('\${c.name}', \${c.running})"
+                class="px-3 py-1.5 rounded-lg border font-medium transition text-xs \${c.running ? 'border-rose-500/30 bg-rose-500/10 text-rose-300 hover:bg-rose-500/20' : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20'}"
+              >
+                \${c.running ? 'Stop Server' : 'Start Server'}
+              </button>
               <a href="http://localhost:\${c.port}" target="_blank" class="px-3 py-1.5 rounded-lg bg-white/10 hover:bg-white text-white hover:text-stone-950 font-medium transition text-xs">
                 Launch →
               </a>
@@ -258,32 +358,46 @@ const server = http.createServer((req, res) => {
       }
     }
 
+    async function toggleServer(name, isRunning) {
+      try {
+        await fetch('/api/serve', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name, action: isRunning ? 'stop' : 'start' })
+        });
+        await loadClones();
+      } catch (err) {
+        console.error(err);
+      }
+    }
+
     async function triggerClone(e) {
       e.preventDefault();
       const url = document.getElementById('urlInput').value;
       const name = document.getElementById('nameInput').value;
+      const engine = document.getElementById('engineSelect').value;
       const btn = document.getElementById('submitBtn');
       const notice = document.getElementById('statusNotice');
 
       btn.disabled = true;
       btn.textContent = 'Ingesting Pipeline...';
       notice.classList.remove('hidden');
-      notice.textContent = 'Connecting to ' + url + ' and crawling stylesheets, fonts, and scripts...';
+      notice.textContent = 'Running ' + engine.toUpperCase() + ' capture for ' + url + '...';
 
       try {
         const res = await fetch('/api/clone', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ targetUrl: url, name: name })
+          body: JSON.stringify({ targetUrl: url, name: name, engine: engine })
         });
         const d = await res.json();
-        notice.textContent = 'Clone pipeline initialized for ' + d.slug + ' on port ' + d.port + '! Refreshing...';
+        notice.textContent = 'Clone pipeline initialized for ' + d.slug + ' on port ' + d.port + ' (' + d.engine + ')! Refreshing...';
         setTimeout(() => {
           loadClones();
           btn.disabled = false;
           btn.textContent = 'Clone Experience';
           notice.classList.add('hidden');
-        }, 3000);
+        }, 4000);
       } catch (err) {
         notice.textContent = 'Error: ' + err.message;
         btn.disabled = false;
@@ -297,9 +411,20 @@ const server = http.createServer((req, res) => {
 </html>`);
 });
 
+function shutdownServers() {
+  for (const proc of activeServers.values()) {
+    try { proc.kill(); } catch {}
+  }
+  activeServers.clear();
+  process.exit(0);
+}
+
+process.on('SIGINT', shutdownServers);
+process.on('SIGTERM', shutdownServers);
+
 server.listen(PORT, () => {
   console.log(`\n=======================================================`);
-  console.log(`🌟 Gemini Webstack Dashboard: http://localhost:${PORT}`);
+  console.log(`🌟 Mimic Studio Dashboard: http://localhost:${PORT}`);
   console.log(`📁 Scanning Clones from:`);
   console.log(`   - ${CLONES_DIR}`);
   console.log(`   - ${LEGACY_CLONES_DIR}`);

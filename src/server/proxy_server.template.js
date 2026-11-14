@@ -1,13 +1,15 @@
 /**
  * Universal Intelligent Hybrid Local & Fallback Proxy Server
  * 
- * 1. Serves all local static assets with high performance and accurate MIME types.
- * 2. On-Demand Upstream Caching: If an asset is requested that is missing locally,
- *    it fetches it from UPSTREAM, serves it to the browser, and saves it to disk
- *    so subsequent requests are 100% offline.
- * 3. API Mock Layer: Intercepts POST/API requests to prevent console errors.
+ * 1. Serves all local static assets with high performance and accurate MIME types (including magic-byte sniffing).
+ * 2. Resolves query-hashed extensionless endpoints and /external/<host>/... CDN routes locally.
+ * 3. On-Demand Upstream Caching: If an asset is requested that is missing locally,
+ *    it fetches it from UPSTREAM (or the external CDN host), serves it to the browser,
+ *    and saves it to disk so subsequent requests are 100% offline.
+ * 4. API Mock Layer: Intercepts POST/API requests to prevent console errors.
  */
 
+const crypto = require('crypto');
 const http = require('http');
 const https = require('https');
 const fs = require('fs');
@@ -16,6 +18,7 @@ const url = require('url');
 
 const PORT = parseInt(process.env.PORT || '{{PORT}}', 10);
 const ROOT = __dirname;
+const RESOLVED_ROOT = path.resolve(ROOT);
 const UPSTREAM = '{{UPSTREAM}}';
 
 const MIME_TYPES = {
@@ -40,6 +43,53 @@ const MIME_TYPES = {
   '.webm': 'video/webm',
   '.wasm': 'application/wasm'
 };
+
+function detectMimeFromBuffer(buf, fallbackExt = '') {
+  if (fallbackExt && MIME_TYPES[fallbackExt]) {
+    return MIME_TYPES[fallbackExt];
+  }
+  if (!buf || buf.length === 0) {
+    return 'application/octet-stream';
+  }
+  if (buf.length >= 4 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47) {
+    return 'image/png';
+  }
+  if (buf.length >= 3 && buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF) {
+    return 'image/jpeg';
+  }
+  if (buf.length >= 12 && buf.slice(0, 4).toString('ascii') === 'RIFF' && buf.slice(8, 12).toString('ascii') === 'WEBP') {
+    return 'image/webp';
+  }
+  if (buf.length >= 4 && buf.slice(0, 4).toString('ascii') === 'GIF8') {
+    return 'image/gif';
+  }
+  if (buf.length >= 12 && buf.slice(4, 12).toString('ascii') === 'ftypavif') {
+    return 'image/avif';
+  }
+  if (buf.length >= 4 && buf.slice(0, 4).toString('ascii') === 'wOF2') {
+    return 'font/woff2';
+  }
+  if (buf.length >= 4 && buf.slice(0, 4).toString('ascii') === 'wOFF') {
+    return 'font/woff';
+  }
+
+  const headText = buf.slice(0, 64).toString('utf8').trimStart().toLowerCase();
+  if (headText.startsWith('<svg') || (headText.startsWith('<?xml') && headText.includes('<svg'))) {
+    return 'image/svg+xml';
+  }
+  if (headText.startsWith('<!doctype') || headText.startsWith('<html')) {
+    return 'text/html; charset=utf-8';
+  }
+  if (headText.startsWith('{') || headText.startsWith('[')) {
+    return 'application/json; charset=utf-8';
+  }
+  return 'application/octet-stream';
+}
+
+function isPathInsideRoot(targetPath) {
+  const rel = path.relative(RESOLVED_ROOT, targetPath);
+  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+}
 
 function fetchUpstream(upstreamUrl, filePath, reqHeaders, res) {
   const parsed = url.parse(upstreamUrl);
@@ -103,7 +153,14 @@ function fetchUpstream(upstreamUrl, filePath, reqHeaders, res) {
 
 const server = http.createServer((req, res) => {
   const parsedUrl = url.parse(req.url, true);
-  let pathname = decodeURIComponent(parsedUrl.pathname);
+  let pathname;
+  try {
+    pathname = decodeURIComponent(parsedUrl.pathname || '/');
+  } catch {
+    res.writeHead(400, { 'Content-Type': 'text/plain' });
+    res.end('400 Bad Request');
+    return;
+  }
 
   // Set global CORS headers
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -129,22 +186,37 @@ const server = http.createServer((req, res) => {
     pathname = '/index.html';
   }
 
-  // Normalize path
-  let safePath = pathname.replace(/^(\.\.[\/\\])+/, '');
-  let filePath = path.join(ROOT, safePath);
+  // Resolve and verify path stays within ROOT (prevents path traversal)
+  let filePath = path.resolve(RESOLVED_ROOT, '.' + pathname);
+  if (!isPathInsideRoot(filePath)) {
+    res.writeHead(403, { 'Content-Type': 'text/plain' });
+    res.end('403 Forbidden');
+    return;
+  }
 
-  // Check if directory, try index.html
-  try {
-    const stat = fs.statSync(filePath);
-    if (stat.isDirectory()) {
-      filePath = path.join(filePath, 'index.html');
+  // Check query-hashed extensionless file first when query parameters exist
+  let hasHashedMatch = false;
+  if (parsedUrl.search && !path.extname(filePath)) {
+    const qHash = crypto.createHash('md5').update(parsedUrl.search).digest('hex').slice(0, 8);
+    const hashedCandidate = `${filePath}_${qHash}`;
+    if (fs.existsSync(hashedCandidate)) {
+      filePath = hashedCandidate;
+      hasHashedMatch = true;
     }
-  } catch (e) {
-    // Does not exist yet, check with .html extension
-    if (!path.extname(filePath)) {
-      const htmlCandidate = filePath + '.html';
-      if (fs.existsSync(htmlCandidate)) {
-        filePath = htmlCandidate;
+  }
+
+  if (!hasHashedMatch) {
+    try {
+      const stat = fs.statSync(filePath);
+      if (stat.isDirectory()) {
+        filePath = path.join(filePath, 'index.html');
+      }
+    } catch (e) {
+      if (!path.extname(filePath)) {
+        const htmlCandidate = filePath + '.html';
+        if (fs.existsSync(htmlCandidate)) {
+          filePath = htmlCandidate;
+        }
       }
     }
   }
@@ -153,7 +225,18 @@ const server = http.createServer((req, res) => {
   fs.stat(filePath, (err, stats) => {
     if (!err && stats.isFile()) {
       const ext = path.extname(filePath).toLowerCase();
-      const contentType = MIME_TYPES[ext] || 'application/octet-stream';
+      let contentType = MIME_TYPES[ext];
+      if (!contentType) {
+        try {
+          const fd = fs.openSync(filePath, 'r');
+          const headBuf = Buffer.alloc(64);
+          const bytesRead = fs.readSync(fd, headBuf, 0, 64, 0);
+          fs.closeSync(fd);
+          contentType = detectMimeFromBuffer(headBuf.subarray(0, bytesRead), ext);
+        } catch {
+          contentType = 'application/octet-stream';
+        }
+      }
 
       res.writeHead(200, {
         'Content-Type': contentType,
@@ -163,11 +246,27 @@ const server = http.createServer((req, res) => {
       return;
     }
 
+    // External CDN route cache miss: /external/<host>/<rest>
+    if (pathname.startsWith('/external/')) {
+      const extMatch = pathname.match(/^\/external\/([^/]+)\/(.+)$/);
+      if (extMatch) {
+        const externalUpstreamUrl = `https://${extMatch[1]}/${extMatch[2]}${parsedUrl.search || ''}`;
+        console.log(`[External Cache Miss] Fetching from CDN: ${externalUpstreamUrl}`);
+        fetchUpstream(externalUpstreamUrl, filePath, req.headers, res);
+        return;
+      }
+    }
+
     // Asset missing locally: Fetch from Upstream
     if (UPSTREAM && UPSTREAM !== 'https://example.com') {
       const upstreamUrl = url.resolve(UPSTREAM, req.url);
       console.log(`[Cache Miss] Fetching from upstream: ${upstreamUrl}`);
-      fetchUpstream(upstreamUrl, filePath, req.headers, res);
+      let cachePath = filePath;
+      if (parsedUrl.search && !path.extname(cachePath)) {
+        const qHash = crypto.createHash('md5').update(parsedUrl.search).digest('hex').slice(0, 8);
+        cachePath = `${cachePath}_${qHash}`;
+      }
+      fetchUpstream(upstreamUrl, cachePath, req.headers, res);
       return;
     }
 
