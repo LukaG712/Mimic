@@ -16,7 +16,7 @@
     "serve": "node src/cli.js serve",
     "verify": "node src/cli.js verify",
     "list": "node src/cli.js list",
-    "test": "node test/url_mapper.test.mjs && node test/turnkey_scaffold.test.mjs && node test/rea_bridge.test.mjs && node test/cdp_stream.test.mjs"
+    "test": "node test/url_mapper.test.mjs && node test/turnkey_scaffold.test.mjs && node test/rea_bridge.test.mjs && node test/dashboard.test.mjs && node test/cdp_stream.test.mjs"
   },
   "keywords": [
     "webstack",

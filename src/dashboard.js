@@ -1,6 +1,6 @@
 /**
- * Mimic Visual Management Studio & Dashboard
- * Runs on http://localhost:4000
+ * Mimic Studio — 10-Pillar Reverse-Engineering Workbench & Dashboard
+ * Runs on http://localhost:4000 (override via DASHBOARD_PORT)
  */
 
 import http from 'http';
@@ -10,6 +10,7 @@ import url from 'url';
 import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 import { runReaAppAnalysis } from './engine/rea_bridge.mjs';
+import { verifyClone } from './engine/verifier.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -17,8 +18,22 @@ const ROOT = path.resolve(__dirname, '..');
 const CLONES_DIR = path.resolve(ROOT, 'clones');
 const LEGACY_CLONES_DIR = 'C:\\Users\\gosse\\Documents\\Gemini\\Clones';
 
-const PORT = 4000;
+const PORT = parseInt(process.env.DASHBOARD_PORT || '4000', 10);
 const activeServers = new Map();
+
+function readJsonSafe(filePath) {
+  if (!fs.existsSync(filePath)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function formatHostFromDescription(desc) {
+  const m = (desc || '').match(/https?:\/\/[^\s)]+/);
+  return m ? m[0] : null;
+}
 
 function getAllClones() {
   const list = [];
@@ -28,49 +43,76 @@ function getAllClones() {
   ];
 
   for (const { base, tag } of dirsToScan) {
-    if (fs.existsSync(base)) {
-      try {
-        const entries = fs.readdirSync(base, { withFileTypes: true });
-        for (const e of entries) {
-          if (e.isDirectory()) {
-            const projectPath = path.join(base, e.name);
-            let description = '';
-            let port = 3000;
-            const pkgPath = path.join(projectPath, 'package.json');
-            if (fs.existsSync(pkgPath)) {
-              try {
-                const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
-                description = pkg.description || '';
-              } catch {}
-            }
-            const serverPath = path.join(projectPath, 'server.js');
-            if (fs.existsSync(serverPath)) {
-              try {
-                const srvText = fs.readFileSync(serverPath, 'utf8');
-                const portMatch = srvText.match(/PORT\s*=\s*(?:process\.env\.PORT\s*\|\|\s*)?(\d+)/);
-                if (portMatch) port = parseInt(portMatch[1], 10);
-              } catch {}
-            }
-            const hasScreenshot = fs.existsSync(path.join(projectPath, 'screenshot.png'));
-            const hasManifest = fs.existsSync(path.join(projectPath, 'clone-manifest.json'));
-            const hasRea = fs.existsSync(path.join(projectPath, 'rea-analysis.json')) || fs.existsSync(path.join(projectPath, 'rea-bundle.json'));
+    if (!fs.existsSync(base)) continue;
+    try {
+      const entries = fs.readdirSync(base, { withFileTypes: true });
+      for (const e of entries) {
+        if (!e.isDirectory()) continue;
+        const projectPath = path.join(base, e.name);
+        const pkg = readJsonSafe(path.join(projectPath, 'package.json'));
+        const manifest = readJsonSafe(path.join(projectPath, 'clone-manifest.json'));
+        const reaBundle = readJsonSafe(path.join(projectPath, 'rea-bundle.json')) || manifest?.rea || null;
+        const reaAnalysis = readJsonSafe(path.join(projectPath, 'rea-analysis.json'));
+        const auditReport = readJsonSafe(path.join(projectPath, 'audit-report.json'));
 
-            list.push({
-              name: e.name,
-              path: projectPath,
-              source: tag,
-              description,
-              port,
-              hasScreenshot,
-              hasManifest,
-              hasRea,
-              running: activeServers.has(e.name)
-            });
-          }
+        const description = pkg?.description || '';
+        let port = 3000;
+        const serverPath = path.join(projectPath, 'server.js');
+        if (fs.existsSync(serverPath)) {
+          try {
+            const srvText = fs.readFileSync(serverPath, 'utf8');
+            const portMatch = srvText.match(/PORT\s*=\s*(?:process\.env\.PORT\s*\|\|\s*)?(\d+)/);
+            if (portMatch) port = parseInt(portMatch[1], 10);
+          } catch {}
         }
-      } catch (err) {
-        console.error('Scan error:', err.message);
+
+        const hasScreenshot = fs.existsSync(path.join(projectPath, 'screenshot.png'));
+        const hasAuditDesktop = hasScreenshot || fs.existsSync(path.join(projectPath, 'audit-desktop.png'));
+        const hasAuditMobile =
+          fs.existsSync(path.join(projectPath, 'screenshot_mobile.png')) ||
+          fs.existsSync(path.join(projectPath, 'audit-mobile.png'));
+        const hasManifest = Boolean(manifest);
+        const hasRea = Boolean(reaBundle || reaAnalysis);
+        const hasAudit = Boolean(auditReport);
+        const engine = hasManifest || fs.existsSync(path.join(projectPath, 'rea-bundle.json')) ? 'cdp' : 'static';
+
+        const palette = Array.isArray(manifest?.page?.colors) ? manifest.page.colors.slice(0, 6) : [];
+        const metrics = {
+          assetCount: manifest?.assetCount ?? 0,
+          totalBytes: (manifest?.totalBytes ?? 0) + (manifest?.domBytes ?? 0),
+          skippedTrackers: manifest?.skippedTrackers ?? 0,
+          routesCount: Array.isArray(reaBundle?.routes) ? reaBundle.routes.length : 0,
+          endpointsCount: Array.isArray(reaBundle?.endpoints) ? reaBundle.endpoints.length : 0,
+          nodeCount: reaAnalysis?.nodeCount ?? 0,
+          edgeCount: reaAnalysis?.edgeCount ?? 0,
+          analyzedModuleCount: reaAnalysis?.analyzedModuleCount ?? reaBundle?.scriptsAnalyzed ?? 0,
+          consoleErrors: Array.isArray(auditReport?.consoleErrors) ? auditReport.consoleErrors.length : 0,
+          networkErrors: Array.isArray(auditReport?.networkErrors) ? auditReport.networkErrors.length : 0,
+          passed: auditReport ? Boolean(auditReport.passed) : null
+        };
+
+        list.push({
+          name: e.name,
+          path: projectPath,
+          source: tag,
+          engine,
+          description,
+          targetUrl: manifest?.url || reaBundle?.targetUrl || formatHostFromDescription(description),
+          capturedAt: manifest?.capturedAt || auditReport?.auditedAt || null,
+          port,
+          hasScreenshot,
+          hasAuditDesktop,
+          hasAuditMobile,
+          hasManifest,
+          hasRea,
+          hasAudit,
+          palette,
+          metrics,
+          running: activeServers.has(e.name)
+        });
       }
+    } catch (err) {
+      console.error('Scan error:', err.message);
     }
   }
   return list;
@@ -79,7 +121,7 @@ function getAllClones() {
 function readJsonBody(req) {
   return new Promise((resolve, reject) => {
     let body = '';
-    req.on('data', chunk => body += chunk);
+    req.on('data', chunk => { body += chunk; });
     req.on('end', () => {
       try {
         resolve(body ? JSON.parse(body) : {});
@@ -91,27 +133,79 @@ function readJsonBody(req) {
   });
 }
 
+function sendJson(res, status, payload) {
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+  res.end(JSON.stringify(payload));
+}
+
+async function waitForHttpPort(port, maxWaitMs = 4000) {
+  const deadline = Date.now() + maxWaitMs;
+  while (Date.now() < deadline) {
+    try {
+      const resp = await fetch(`http://127.0.0.1:${port}/`);
+      if (resp.status >= 200 && resp.status < 500) return true;
+    } catch {}
+    await new Promise(r => setTimeout(r, 100));
+  }
+  return false;
+}
+
+function startCloneServer(match) {
+  if (activeServers.has(match.name)) {
+    return { child: activeServers.get(match.name), startedTransiently: false };
+  }
+  const serverPath = path.join(match.path, 'server.js');
+  if (!fs.existsSync(serverPath)) {
+    throw new Error(`server.js missing in ${match.path}`);
+  }
+  const child = spawn('node', ['server.js'], {
+    cwd: match.path,
+    env: { ...process.env, PORT: String(match.port) },
+    stdio: 'ignore'
+  });
+  activeServers.set(match.name, child);
+  child.on('exit', () => {
+    activeServers.delete(match.name);
+  });
+  return { child, startedTransiently: true };
+}
+
 const server = http.createServer(async (req, res) => {
   const parsed = url.parse(req.url, true);
 
   if (parsed.pathname === '/api/clones') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ clones: getAllClones() }));
+    sendJson(res, 200, { clones: getAllClones() });
+    return;
+  }
+
+  if (parsed.pathname === '/api/inspect' && req.method === 'GET') {
+    const name = String(parsed.query.name || '');
+    const clones = getAllClones();
+    const match = clones.find(c => c.name === name);
+    if (!match) {
+      sendJson(res, 404, { error: `Clone "${name}" not found` });
+      return;
+    }
+    const manifest = readJsonSafe(path.join(match.path, 'clone-manifest.json'));
+    const reaBundle = readJsonSafe(path.join(match.path, 'rea-bundle.json')) || manifest?.rea || null;
+    const reaAnalysis = readJsonSafe(path.join(match.path, 'rea-analysis.json'));
+    const auditReport = readJsonSafe(path.join(match.path, 'audit-report.json'));
+    sendJson(res, 200, { clone: match, manifest, reaBundle, reaAnalysis, auditReport });
     return;
   }
 
   if (parsed.pathname === '/api/clone' && req.method === 'POST') {
     try {
-      const { targetUrl, name, port, engine = 'cdp', rea = false } = await readJsonBody(req);
+      const { targetUrl, name, port, engine = 'cdp', rea = true, fetchSourceMaps = false } = await readJsonBody(req);
       if (!targetUrl) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Missing targetUrl' }));
+        sendJson(res, 400, { error: 'Missing targetUrl' });
         return;
       }
 
       const slug = (name || targetUrl.replace(/^https?:\/\//, '').replace(/[^a-zA-Z0-9]/g, '-') + '-clone')
         .toLowerCase()
-        .replace(/[^a-z0-9-_]/g, '-');
+        .replace(/[^a-z0-9-_]/g, '-')
+        .replace(/^-+|-+$/g, '') || 'cloned-site';
       const targetDir = path.join(CLONES_DIR, slug);
       const assignedPort = port || (3010 + Math.floor(Math.random() * 80));
 
@@ -125,20 +219,17 @@ const server = http.createServer(async (req, res) => {
         const cdpScript = path.join(__dirname, 'engine', 'cdp_capture.mjs');
         const cdpArgs = [cdpScript, targetUrl, targetDir, String(assignedPort)];
         if (rea) cdpArgs.push('--rea');
-        child = spawn('node', cdpArgs, {
-          stdio: 'inherit'
-        });
+        if (rea && fetchSourceMaps) cdpArgs.push('--fetch-source-maps');
+        child = spawn('node', cdpArgs, { stdio: 'inherit' });
       }
 
       child.on('close', (code) => {
         console.log(`Cloning (${engine}) finished for ${slug} with code ${code}`);
       });
 
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, slug, targetDir, port: assignedPort, engine }));
+      sendJson(res, 200, { ok: true, slug, targetDir, port: assignedPort, engine, rea: Boolean(rea) });
     } catch (err) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: err.message }));
+      sendJson(res, 500, { error: err.message });
     }
     return;
   }
@@ -148,10 +239,8 @@ const server = http.createServer(async (req, res) => {
       const { name, action = 'start' } = await readJsonBody(req);
       const clones = getAllClones();
       const match = clones.find(c => c.name === name);
-
       if (!match) {
-        res.writeHead(404, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: `Clone "${name}" not found` }));
+        sendJson(res, 404, { error: `Clone "${name}" not found` });
         return;
       }
 
@@ -161,40 +250,14 @@ const server = http.createServer(async (req, res) => {
           try { proc.kill(); } catch {}
           activeServers.delete(match.name);
         }
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, name: match.name, running: false }));
+        sendJson(res, 200, { ok: true, name: match.name, running: false });
         return;
       }
 
-      if (activeServers.has(match.name)) {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, name: match.name, running: true, port: match.port }));
-        return;
-      }
-
-      const serverPath = path.join(match.path, 'server.js');
-      if (!fs.existsSync(serverPath)) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: `server.js missing in ${match.path}` }));
-        return;
-      }
-
-      const child = spawn('node', ['server.js'], {
-        cwd: match.path,
-        env: { ...process.env, PORT: String(match.port) },
-        stdio: 'ignore'
-      });
-
-      activeServers.set(match.name, child);
-      child.on('exit', () => {
-        activeServers.delete(match.name);
-      });
-
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, name: match.name, running: true, port: match.port }));
+      startCloneServer(match);
+      sendJson(res, 200, { ok: true, name: match.name, running: true, port: match.port });
     } catch (err) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: err.message }));
+      sendJson(res, 500, { error: err.message });
     }
     return;
   }
@@ -205,24 +268,59 @@ const server = http.createServer(async (req, res) => {
       const clones = getAllClones();
       const match = clones.find(c => c.name === name);
       if (!match) {
-        res.writeHead(404, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: `Clone "${name}" not found` }));
+        sendJson(res, 404, { error: `Clone "${name}" not found` });
         return;
       }
       const summary = await runReaAppAnalysis(match.path);
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, name: match.name, summary }));
+      sendJson(res, 200, { ok: true, name: match.name, summary });
     } catch (err) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: err.message }));
+      sendJson(res, 500, { error: err.message });
+    }
+    return;
+  }
+
+  if (parsed.pathname === '/api/verify' && req.method === 'POST') {
+    let transientChild = null;
+    let transientName = null;
+    try {
+      const { name } = await readJsonBody(req);
+      const clones = getAllClones();
+      const match = clones.find(c => c.name === name);
+      if (!match) {
+        sendJson(res, 404, { error: `Clone "${name}" not found` });
+        return;
+      }
+
+      const srv = startCloneServer(match);
+      if (srv.startedTransiently) {
+        transientChild = srv.child;
+        transientName = match.name;
+      }
+
+      const ready = await waitForHttpPort(match.port, 4000);
+      if (!ready) {
+        throw new Error(`Clone server did not respond on port ${match.port}`);
+      }
+
+      const report = await verifyClone(`http://localhost:${match.port}`, match.path, {
+        quiet: true,
+        timeout: 45000
+      });
+      sendJson(res, 200, { ok: true, name: match.name, report });
+    } catch (err) {
+      sendJson(res, 500, { error: err.message });
+    } finally {
+      if (transientChild) {
+        try { transientChild.kill(); } catch {}
+        if (transientName) activeServers.delete(transientName);
+      }
     }
     return;
   }
 
   if (parsed.pathname.startsWith('/screenshot/')) {
     const projName = decodeURIComponent(parsed.pathname.replace('/screenshot/', ''));
-    const clones = getAllClones();
-    const match = clones.find(c => c.name === projName);
+    const match = getAllClones().find(c => c.name === projName);
     if (match) {
       const shotPath = path.join(match.path, 'screenshot.png');
       if (fs.existsSync(shotPath)) {
@@ -236,175 +334,779 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Dashboard HTML
+  if (parsed.pathname.startsWith('/audit-image/')) {
+    const parts = parsed.pathname.split('/').filter(Boolean);
+    const viewport = parts[1];
+    const projName = decodeURIComponent(parts.slice(2).join('/'));
+    const match = getAllClones().find(c => c.name === projName);
+    if (match) {
+      const candidates =
+        viewport === 'mobile'
+          ? ['screenshot_mobile.png', 'audit-mobile.png']
+          : ['screenshot.png', 'audit-desktop.png'];
+      for (const file of candidates) {
+        const candidatePath = path.join(match.path, file);
+        if (fs.existsSync(candidatePath)) {
+          res.writeHead(200, { 'Content-Type': 'image/png' });
+          fs.createReadStream(candidatePath).pipe(res);
+          return;
+        }
+      }
+    }
+    res.writeHead(404);
+    res.end();
+    return;
+  }
+
+  // Dashboard HTML (10-Pillar Workbench)
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-  res.end(`<!DOCTYPE html>
-<html lang="en" class="dark">
+  res.end(RENDER_DASHBOARD_HTML());
+});
+
+function RENDER_DASHBOARD_HTML() {
+  return `<!DOCTYPE html>
+<html lang="en" data-theme="linear">
 <head>
-  <meta charset="UTF-8">
-  <title>Mimic Studio — Reverse-Engineering & Cloning Suite</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta charset="UTF-8" />
+  <title>Mimic Studio</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
-    @import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,600;1,400&family=Inter:wght@400;500;600;700&display=swap');
-    body { font-family: 'Inter', system-ui, sans-serif; background-color: #0c0d0e; color: #e5e5e5; }
-    .font-editorial { font-family: 'Cormorant Garamond', Georgia, serif; }
+    @import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;0,600;1,400&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+    :root, html[data-theme="linear"] {
+      --bg: #08090a;
+      --bg-elevated: #101216;
+      --bg-subtle: #16191f;
+      --bg-glass: rgba(12, 13, 16, 0.78);
+      --border: rgba(255, 255, 255, 0.08);
+      --border-strong: rgba(255, 255, 255, 0.16);
+      --text: #f3f4f6;
+      --text-muted: #9ca3af;
+      --text-dim: #6b7280;
+      --accent: #f59e0b;
+      --accent-soft: rgba(245, 158, 11, 0.14);
+      --accent-fg: #111111;
+      --ok: #10b981;
+      --ok-soft: rgba(16, 185, 129, 0.14);
+      --danger: #f43f5e;
+      --danger-soft: rgba(244, 63, 94, 0.14);
+      --font-display: 'Inter', system-ui, sans-serif;
+      --font-sans: 'Inter', system-ui, sans-serif;
+      --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+      --shadow-card: 0 1px 0 rgba(255,255,255,0.04) inset, 0 16px 36px -20px rgba(0,0,0,0.8);
+    }
+
+    html[data-theme="aesop"] {
+      --bg: #f6f5e8;
+      --bg-elevated: #eeecdb;
+      --bg-subtle: #e5e2ce;
+      --bg-glass: rgba(246, 245, 232, 0.85);
+      --border: rgba(26, 25, 23, 0.11);
+      --border-strong: rgba(26, 25, 23, 0.24);
+      --text: #1a1917;
+      --text-muted: #57534a;
+      --text-dim: #787366;
+      --accent: #8c5a32;
+      --accent-soft: rgba(140, 90, 50, 0.12);
+      --accent-fg: #f6f5e8;
+      --ok: #2f6f4e;
+      --ok-soft: rgba(47, 111, 78, 0.12);
+      --danger: #a63434;
+      --danger-soft: rgba(166, 52, 52, 0.12);
+      --font-display: 'Cormorant Garamond', Georgia, serif;
+      --font-sans: 'Inter', system-ui, sans-serif;
+      --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+      --shadow-card: 0 1px 2px rgba(26,25,23,0.05);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: var(--font-sans);
+      background: var(--bg);
+      color: var(--text);
+      transition: background-color 280ms cubic-bezier(0.22, 1, 0.36, 1), color 280ms cubic-bezier(0.22, 1, 0.36, 1);
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .font-display { font-family: var(--font-display); }
+    .font-mono { font-family: var(--font-mono); }
+    .tabular-nums { font-variant-numeric: tabular-nums; }
+
+    .surface {
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      box-shadow: var(--shadow-card);
+    }
+
+    .glass-bar {
+      background: var(--bg-glass);
+      backdrop-filter: blur(20px) saturate(180%);
+      -webkit-backdrop-filter: blur(20px) saturate(180%);
+      border-bottom: 1px solid var(--border);
+    }
+
+    .spring-btn {
+      transition: transform 180ms cubic-bezier(0.34, 1.56, 0.64, 1), background-color 160ms ease, border-color 160ms ease, opacity 160ms ease;
+    }
+    .spring-btn:hover { transform: translateY(-1px); }
+    .spring-btn:active { transform: scale(0.97); }
+
+    .card-apple {
+      transition: transform 280ms cubic-bezier(0.22, 1, 0.36, 1), border-color 220ms ease, box-shadow 280ms cubic-bezier(0.22, 1, 0.36, 1);
+    }
+    .card-apple:hover {
+      transform: translateY(-2px);
+      border-color: var(--border-strong);
+    }
+
+    .kbd-chip {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      padding: 2px 6px;
+      border-radius: 5px;
+      border: 1px solid var(--border-strong);
+      background: var(--bg-subtle);
+      color: var(--text-muted);
+    }
+
+    /* Stripe Pipeline Connector Flow */
+    .pipeline-node {
+      border: 1px solid var(--border);
+      background: var(--bg-elevated);
+      transition: border-color 260ms ease, background-color 260ms ease, transform 260ms cubic-bezier(0.22, 1, 0.36, 1);
+    }
+    .pipeline-node.active {
+      border-color: var(--accent);
+      background: var(--accent-soft);
+      transform: translateY(-1px);
+    }
+    .pipeline-node.done {
+      border-color: var(--ok);
+      background: var(--ok-soft);
+    }
+    .pipeline-line {
+      height: 2px;
+      background: var(--border);
+      position: relative;
+      overflow: hidden;
+    }
+    .pipeline-line.active::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      width: 45%;
+      background: var(--accent);
+      animation: flowPulse 1.1s cubic-bezier(0.22, 1, 0.36, 1) infinite;
+    }
+    @keyframes flowPulse {
+      0% { transform: translateX(-100%); }
+      100% { transform: translateX(240%); }
+    }
+
+    /* Apple Side-Peek Drawer */
+    .drawer-backdrop {
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 260ms cubic-bezier(0.22, 1, 0.36, 1);
+    }
+    .drawer-backdrop.open {
+      opacity: 1;
+      pointer-events: auto;
+    }
+    .drawer-panel {
+      transform: translateX(100%);
+      transition: transform 320ms cubic-bezier(0.22, 1, 0.36, 1);
+      background: var(--bg);
+      border-left: 1px solid var(--border);
+    }
+    .drawer-panel.open {
+      transform: translateX(0);
+    }
+
+    /* Command Palette */
+    .palette-backdrop {
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 180ms ease;
+    }
+    .palette-backdrop.open {
+      opacity: 1;
+      pointer-events: auto;
+    }
+    .palette-box {
+      transform: scale(0.96) translateY(-8px);
+      transition: transform 220ms cubic-bezier(0.22, 1, 0.36, 1);
+      background: var(--bg-elevated);
+      border: 1px solid var(--border-strong);
+    }
+    .palette-backdrop.open .palette-box {
+      transform: scale(1) translateY(0);
+    }
+
+    input, select {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+    }
+    input:focus, select:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
   </style>
 </head>
-<body class="min-h-screen antialiased flex flex-col justify-between">
-  <div>
-    <!-- Header -->
-    <header class="border-b border-white/10 px-8 py-5 flex items-center justify-between bg-stone-950/80 backdrop-blur sticky top-0 z-40">
+<body class="min-h-screen flex flex-col">
+
+  <!-- Sticky Translucent Top Header (Apple + Linear + Aesop Toggle) -->
+  <header class="glass-bar sticky top-0 z-30 px-6 py-3">
+    <div class="max-w-7xl mx-auto flex items-center justify-between gap-4">
       <div class="flex items-center gap-3">
-        <div class="size-8 rounded-lg bg-amber-400 text-stone-950 font-bold flex items-center justify-center text-sm">M</div>
-        <div>
-          <span class="font-editorial text-2xl text-white">Mimic Studio</span>
-          <span class="text-xs text-stone-400 ml-2 font-mono">v1.1.0</span>
+        <div class="w-7 h-7 rounded-lg flex items-center justify-center font-mono text-xs font-semibold" style="background: var(--accent); color: var(--accent-fg);">M</div>
+        <span class="font-display text-xl tracking-tight font-semibold">Mimic Studio</span>
+        <span class="font-mono text-[11px] px-2 py-0.5 rounded-md tabular-nums" style="background: var(--bg-subtle); border: 1px solid var(--border); color: var(--text-muted);">CDP + REA</span>
+      </div>
+
+      <div class="flex items-center gap-2.5">
+        <button onclick="openCommandPalette()" class="spring-btn hidden sm:inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs" style="background: var(--bg-elevated); border: 1px solid var(--border); color: var(--text-muted);">
+          <span>Commands</span>
+          <span class="kbd-chip">Ctrl K</span>
+        </button>
+
+        <button id="themeToggle" onclick="toggleTheme()" title="Switch between Linear Dark and Aesop Editorial Light (T)" class="spring-btn inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium" style="background: var(--bg-elevated); border: 1px solid var(--border); color: var(--text);">
+          <span id="themeLabel">Aesop Light</span>
+          <span class="kbd-chip">T</span>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <main class="max-w-7xl w-full mx-auto px-6 py-8 space-y-8 flex-1">
+
+    <!-- Duolingo-Style 3-Step Interactive Onboarding Bar -->
+    <section id="onboardingBar" class="surface rounded-2xl p-4 sm:p-5">
+      <div class="flex items-center justify-between gap-4 mb-3">
+        <div class="flex items-center gap-3">
+          <span class="font-mono text-[11px] uppercase tracking-wider px-2 py-0.5 rounded" style="background: var(--accent-soft); color: var(--accent);">Workflow</span>
+          <span class="text-sm font-medium">Workspace readiness</span>
+          <span id="onboardingFraction" class="font-mono text-xs tabular-nums" style="color: var(--text-muted);">0/3 complete</span>
         </div>
+        <button onclick="toggleOnboarding()" class="text-xs font-mono hover:underline" style="color: var(--text-muted);">Hide</button>
       </div>
-      <div class="flex items-center gap-4 text-xs">
-        <span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full border border-emerald-500/20 bg-emerald-500/10 text-emerald-400">
-          <span class="size-1.5 rounded-full bg-emerald-400"></span> In-Flight CDP Ready
-        </span>
+      <div class="w-full h-1.5 rounded-full overflow-hidden mb-4" style="background: var(--bg-subtle);">
+        <div id="onboardingProgress" class="h-full rounded-full transition-all duration-500" style="width: 0%; background: var(--ok);"></div>
       </div>
-    </header>
-
-    <!-- Main Container -->
-    <main class="max-w-6xl mx-auto px-6 py-12 space-y-12">
-      <!-- Hero / Input Box -->
-      <section class="rounded-3xl border border-white/10 bg-stone-900/60 p-8 sm:p-10 shadow-2xl relative overflow-hidden">
-        <h1 class="font-editorial text-4xl sm:text-5xl font-normal text-white leading-tight">
-          High-Fidelity Reverse-Engineering & Cloning Engine
-        </h1>
-        <p class="text-sm text-stone-400 mt-2 max-w-2xl leading-relaxed">
-          Ingest any production URL via real-time CDP stream interception or parallel static crawling with automated multi-CDN proxy scaffolding.
-        </p>
-
-        <form id="cloneForm" class="mt-8" onsubmit="triggerClone(event)">
-          <div class="grid grid-cols-1 sm:grid-cols-12 gap-3">
-            <div class="sm:col-span-5">
-              <input 
-                id="urlInput"
-                type="url" 
-                required 
-                placeholder="https://example.com" 
-                class="w-full px-4 py-3 rounded-xl bg-black/60 border border-white/10 text-white placeholder-stone-500 text-sm focus:outline-none focus:border-amber-400"
-              />
-            </div>
-            <div class="sm:col-span-2">
-              <input 
-                id="nameInput"
-                type="text" 
-                placeholder="slug (optional)" 
-                class="w-full px-4 py-3 rounded-xl bg-black/60 border border-white/10 text-white placeholder-stone-500 text-sm focus:outline-none focus:border-amber-400"
-              />
-            </div>
-            <div class="sm:col-span-2">
-              <select
-                id="engineSelect"
-                class="w-full px-3 py-3 rounded-xl bg-black/60 border border-white/10 text-white text-sm focus:outline-none focus:border-amber-400"
-              >
-                <option value="cdp">In-Flight CDP</option>
-                <option value="static">Static Python</option>
-              </select>
-            </div>
-            <div class="sm:col-span-3">
-              <button 
-                type="submit" 
-                id="submitBtn"
-                class="w-full py-3 px-6 rounded-xl bg-white text-stone-900 font-semibold text-sm hover:bg-stone-200 active:scale-[0.98] transition shadow-md"
-              >
-                Clone Experience
-              </button>
-            </div>
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
+        <div id="stepCapture" class="rounded-xl p-3 flex items-center justify-between" style="background: var(--bg); border: 1px solid var(--border);">
+          <div>
+            <div class="font-medium">1. Capture a site</div>
+            <div style="color: var(--text-muted);" class="mt-0.5">Ingest rendered DOM &amp; network assets</div>
           </div>
-          <label class="inline-flex items-center gap-2 mt-4 text-xs text-stone-300 cursor-pointer select-none">
-            <input id="reaCheck" type="checkbox" checked class="rounded bg-black/60 border-white/20 text-amber-400 focus:ring-0" />
-            <span>Run REA live bundle &amp; endpoint analysis (CDP mode)</span>
+          <button onclick="focusCapture()" class="spring-btn px-2.5 py-1 rounded-md font-mono text-[11px]" style="background: var(--bg-subtle); border: 1px solid var(--border);">Focus</button>
+        </div>
+        <div id="stepRea" class="rounded-xl p-3 flex items-center justify-between" style="background: var(--bg); border: 1px solid var(--border);">
+          <div>
+            <div class="font-medium">2. Inspect with REA</div>
+            <div style="color: var(--text-muted);" class="mt-0.5">Extract chunks, routes, and API endpoints</div>
+          </div>
+          <button onclick="runFirstMissingRea()" class="spring-btn px-2.5 py-1 rounded-md font-mono text-[11px]" style="background: var(--bg-subtle); border: 1px solid var(--border);">Analyze</button>
+        </div>
+        <div id="stepVerify" class="rounded-xl p-3 flex items-center justify-between" style="background: var(--bg); border: 1px solid var(--border);">
+          <div>
+            <div class="font-medium">3. Serve or verify</div>
+            <div style="color: var(--text-muted);" class="mt-0.5">Run offline proxy &amp; viewport audit</div>
+          </div>
+          <button onclick="runFirstMissingVerify()" class="spring-btn px-2.5 py-1 rounded-md font-mono text-[11px]" style="background: var(--bg-subtle); border: 1px solid var(--border);">Audit</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- Capture Form + Stripe-Style Pipeline Flow Visualizer -->
+    <section class="surface rounded-2xl p-6 sm:p-8 space-y-6">
+      <div class="flex flex-col md:flex-row md:items-end justify-between gap-4">
+        <div>
+          <h1 class="font-display text-3xl sm:text-4xl font-semibold tracking-tight">Capture &amp; Reverse-Engineer</h1>
+          <p class="text-sm mt-1.5" style="color: var(--text-muted);">
+            Stream browser responses directly to disk via CDP or crawl static assets in parallel, then inspect bundles offline.
+          </p>
+        </div>
+        <div class="flex items-center gap-2 text-xs font-mono" style="color: var(--text-dim);">
+          <span>Shortcuts:</span>
+          <span class="kbd-chip">C</span><span>Capture</span>
+          <span class="kbd-chip">/</span><span>Search</span>
+        </div>
+      </div>
+
+      <form id="cloneForm" onsubmit="triggerClone(event)" class="space-y-4">
+        <div class="grid grid-cols-1 sm:grid-cols-12 gap-3">
+          <div class="sm:col-span-5">
+            <input id="urlInput" type="url" required placeholder="https://example.com" class="w-full px-3.5 py-2.5 rounded-xl text-sm font-mono" />
+          </div>
+          <div class="sm:col-span-2">
+            <input id="nameInput" type="text" placeholder="slug (optional)" class="w-full px-3.5 py-2.5 rounded-xl text-sm font-mono" />
+          </div>
+          <div class="sm:col-span-2">
+            <select id="engineSelect" class="w-full px-3 py-2.5 rounded-xl text-sm">
+              <option value="cdp">CDP Stream</option>
+              <option value="static">Static Python</option>
+            </select>
+          </div>
+          <div class="sm:col-span-3">
+            <button type="submit" id="submitBtn" class="spring-btn w-full py-2.5 px-4 rounded-xl text-sm font-semibold" style="background: var(--accent); color: var(--accent-fg);">
+              Start Capture
+            </button>
+          </div>
+        </div>
+
+        <div class="flex flex-wrap items-center gap-5 text-xs" style="color: var(--text-muted);">
+          <label class="inline-flex items-center gap-2 cursor-pointer select-none">
+            <input id="reaCheck" type="checkbox" checked />
+            <span>Run REA bundle analysis (<code class="font-mono">rea analyze-web-bundle</code>)</span>
           </label>
-        </form>
+          <label class="inline-flex items-center gap-2 cursor-pointer select-none">
+            <input id="sourceMapsCheck" type="checkbox" />
+            <span>Fetch source maps</span>
+          </label>
+        </div>
+      </form>
 
-        <div id="statusNotice" class="hidden mt-4 p-3 rounded-xl bg-amber-400/10 border border-amber-400/30 text-amber-300 text-xs font-mono"></div>
-      </section>
+      <!-- Stripe Connected Node Pipeline Visualizer -->
+      <div id="pipelineFlow" class="pt-2">
+        <div class="grid grid-cols-1 sm:grid-cols-7 items-center gap-2 text-xs">
+          <div id="pipeNode1" class="pipeline-node rounded-xl p-3 sm:col-span-1">
+            <div class="font-mono text-[10px] uppercase" style="color: var(--text-dim);">Stage 01</div>
+            <div class="font-medium mt-0.5 truncate">Origin URL</div>
+          </div>
+          <div id="pipeLine1" class="pipeline-line hidden sm:block"></div>
+          <div id="pipeNode2" class="pipeline-node rounded-xl p-3 sm:col-span-1">
+            <div class="font-mono text-[10px] uppercase" style="color: var(--text-dim);">Stage 02</div>
+            <div class="font-medium mt-0.5 truncate">CDP Stream</div>
+          </div>
+          <div id="pipeLine2" class="pipeline-line hidden sm:block"></div>
+          <div id="pipeNode3" class="pipeline-node rounded-xl p-3 sm:col-span-1">
+            <div class="font-mono text-[10px] uppercase" style="color: var(--text-dim);">Stage 03</div>
+            <div class="font-medium mt-0.5 truncate">REA AST</div>
+          </div>
+          <div id="pipeLine3" class="pipeline-line hidden sm:block"></div>
+          <div id="pipeNode4" class="pipeline-node rounded-xl p-3 sm:col-span-1">
+            <div class="font-mono text-[10px] uppercase" style="color: var(--text-dim);">Stage 04</div>
+            <div class="font-medium mt-0.5 truncate">Local Proxy</div>
+          </div>
+        </div>
+      </div>
 
-      <!-- Cloned Projects Directory -->
-      <section class="space-y-6">
-        <div class="flex items-center justify-between pb-3 border-b border-white/10">
-          <h2 class="font-editorial text-3xl font-normal text-white">Ingested Architectures & Clones</h2>
-          <span id="cloneCount" class="text-xs text-stone-400 font-mono">Loading...</span>
+      <div id="statusNotice" class="hidden p-3 rounded-xl font-mono text-xs" style="background: var(--accent-soft); border: 1px solid var(--accent); color: var(--text);"></div>
+    </section>
+
+    <!-- Airbnb Filter Bar + Notion Gallery/Table View Switcher -->
+    <section class="space-y-4">
+      <div class="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+        <div class="flex flex-wrap items-center gap-1.5" id="filterPills">
+          <!-- Populated dynamically with live counts -->
         </div>
 
-        <div id="grid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-          <!-- Dynamically populated -->
-        </div>
-      </section>
-    </main>
-  </div>
+        <div class="flex flex-wrap items-center gap-2.5">
+          <input id="searchInput" type="search" placeholder="Filter by slug or URL (/)" oninput="renderClones()" class="px-3 py-1.5 rounded-lg text-xs w-52 font-mono" />
 
-  <footer class="border-t border-white/10 py-6 text-center text-xs text-stone-400 font-mono">
-    Mimic Studio • Local Reverse-Engineering Suite
+          <select id="sortSelect" onchange="renderClones()" class="px-2.5 py-1.5 rounded-lg text-xs font-mono">
+            <option value="name">Sort: Name</option>
+            <option value="size">Sort: Size</option>
+            <option value="assets">Sort: Assets</option>
+            <option value="port">Sort: Port</option>
+          </select>
+
+          <div class="inline-flex rounded-lg p-0.5" style="background: var(--bg-elevated); border: 1px solid var(--border);">
+            <button id="viewGalleryBtn" onclick="setViewMode('gallery')" class="px-2.5 py-1 rounded-md text-xs font-medium transition">Gallery</button>
+            <button id="viewTableBtn" onclick="setViewMode('table')" class="px-2.5 py-1 rounded-md text-xs font-medium transition">Table</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Clone Catalog Container -->
+      <div id="catalogContainer"></div>
+    </section>
+  </main>
+
+  <footer class="px-6 py-5 text-center font-mono text-xs" style="border-top: 1px solid var(--border); color: var(--text-dim);">
+    Mimic Studio • Local Reverse-Engineering Workbench
   </footer>
 
+  <!-- Notion-Style Side-Peek Inspector Drawer -->
+  <div id="drawerBackdrop" class="drawer-backdrop fixed inset-0 z-40 bg-black/50 backdrop-blur-sm" onclick="closeInspector()"></div>
+  <aside id="inspectorDrawer" class="drawer-panel fixed top-0 right-0 bottom-0 w-full max-w-2xl z-50 flex flex-col shadow-2xl">
+    <div class="px-6 py-4 flex items-center justify-between" style="border-bottom: 1px solid var(--border);">
+      <div class="min-w-0">
+        <div class="flex items-center gap-2">
+          <h2 id="drawerTitle" class="font-display text-xl font-semibold truncate">Inspector</h2>
+          <span id="drawerPortBadge" class="font-mono text-xs px-2 py-0.5 rounded tabular-nums" style="background: var(--bg-subtle); border: 1px solid var(--border);"></span>
+        </div>
+        <div id="drawerUrl" class="font-mono text-xs truncate mt-0.5" style="color: var(--text-muted);"></div>
+      </div>
+      <div class="flex items-center gap-2">
+        <span class="kbd-chip">Esc</span>
+        <button onclick="closeInspector()" class="spring-btn px-2.5 py-1 rounded-lg text-xs" style="background: var(--bg-subtle); border: 1px solid var(--border);">Close</button>
+      </div>
+    </div>
+
+    <!-- Drawer Tabs -->
+    <div class="px-6 flex items-center gap-1 pt-2" style="border-bottom: 1px solid var(--border); background: var(--bg-elevated);">
+      <button onclick="setInspectorTab('overview')" data-tab="overview" class="inspector-tab px-3 py-2 text-xs font-medium border-b-2">Overview &amp; Tokens</button>
+      <button onclick="setInspectorTab('rea')" data-tab="rea" class="inspector-tab px-3 py-2 text-xs font-medium border-b-2">REA Intelligence</button>
+      <button onclick="setInspectorTab('audit')" data-tab="audit" class="inspector-tab px-3 py-2 text-xs font-medium border-b-2">Visual Audit</button>
+      <button onclick="setInspectorTab('cli')" data-tab="cli" class="inspector-tab px-3 py-2 text-xs font-medium border-b-2">CLI &amp; Proxy</button>
+    </div>
+
+    <div id="drawerBody" class="p-6 overflow-y-auto flex-1 space-y-6 text-xs"></div>
+  </aside>
+
+  <!-- Linear-Style Cmd+K Command Palette -->
+  <div id="cmdPalette" class="palette-backdrop fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-start justify-center pt-24 px-4" onclick="if (event.target === this) closeCommandPalette()">
+    <div class="palette-box w-full max-w-lg rounded-2xl overflow-hidden shadow-2xl">
+      <div class="p-3" style="border-bottom: 1px solid var(--border);">
+        <input id="paletteInput" type="text" placeholder="Type a command or clone name..." oninput="renderPaletteItems()" class="w-full px-3 py-2 rounded-lg text-sm font-mono border-0 bg-transparent focus:ring-0" />
+      </div>
+      <div id="paletteList" class="max-h-80 overflow-y-auto p-2 space-y-1"></div>
+    </div>
+  </div>
+
   <script>
+    const state = {
+      clones: [],
+      filter: 'all',
+      viewMode: localStorage.getItem('mimic_view') || 'gallery',
+      theme: localStorage.getItem('mimic_theme') || 'linear',
+      inspector: { open: false, name: null, tab: 'overview', data: null, viewport: 'desktop' },
+      paletteIndex: 0
+    };
+
+    function escapeHtml(str) {
+      return String(str == null ? '' : str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+
+    function formatBytes(bytes) {
+      if (!bytes) return '0 B';
+      if (bytes < 1024) return bytes + ' B';
+      if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+      return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
+    }
+
+    function applyTheme(theme) {
+      state.theme = theme;
+      document.documentElement.setAttribute('data-theme', theme);
+      localStorage.setItem('mimic_theme', theme);
+      const label = document.getElementById('themeLabel');
+      if (label) label.textContent = theme === 'aesop' ? 'Linear Dark' : 'Aesop Light';
+    }
+
+    function toggleTheme() {
+      applyTheme(state.theme === 'linear' ? 'aesop' : 'linear');
+    }
+
+    function setPipelineStage(activeStage, doneStages) {
+      const doneSet = new Set(doneStages || []);
+      for (let i = 1; i <= 4; i++) {
+        const node = document.getElementById('pipeNode' + i);
+        if (node) {
+          node.classList.remove('active', 'done');
+          if (doneSet.has(i)) node.classList.add('done');
+          else if (activeStage === i) node.classList.add('active');
+        }
+        if (i < 4) {
+          const line = document.getElementById('pipeLine' + i);
+          if (line) {
+            line.classList.toggle('active', activeStage === i || activeStage === i + 1);
+          }
+        }
+      }
+    }
+
+    function updateOnboarding() {
+      if (localStorage.getItem('mimic_onboarding_hidden') === '1') {
+        document.getElementById('onboardingBar').classList.add('hidden');
+        return;
+      }
+      const hasAnyClone = state.clones.length > 0;
+      const hasAnyRea = state.clones.some(c => c.hasRea);
+      const hasAnyLiveOrAudit = state.clones.some(c => c.running || c.hasAudit);
+
+      const doneCount = (hasAnyClone ? 1 : 0) + (hasAnyRea ? 1 : 0) + (hasAnyLiveOrAudit ? 1 : 0);
+      document.getElementById('onboardingFraction').textContent = doneCount + '/3 complete';
+      document.getElementById('onboardingProgress').style.width = Math.round((doneCount / 3) * 100) + '%';
+
+      markStep('stepCapture', hasAnyClone);
+      markStep('stepRea', hasAnyRea);
+      markStep('stepVerify', hasAnyLiveOrAudit);
+    }
+
+    function markStep(id, done) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.style.borderColor = done ? 'var(--ok)' : 'var(--border)';
+      el.style.background = done ? 'var(--ok-soft)' : 'var(--bg)';
+    }
+
+    function toggleOnboarding() {
+      localStorage.setItem('mimic_onboarding_hidden', '1');
+      document.getElementById('onboardingBar').classList.add('hidden');
+    }
+
+    function focusCapture() {
+      const inp = document.getElementById('urlInput');
+      if (inp) { inp.focus(); inp.select(); }
+    }
+
+    function setViewMode(mode) {
+      state.viewMode = mode;
+      localStorage.setItem('mimic_view', mode);
+      document.getElementById('viewGalleryBtn').style.background = mode === 'gallery' ? 'var(--bg-subtle)' : 'transparent';
+      document.getElementById('viewTableBtn').style.background = mode === 'table' ? 'var(--bg-subtle)' : 'transparent';
+      renderClones();
+    }
+
+    function setFilter(f) {
+      state.filter = f;
+      renderFilterPills();
+      renderClones();
+    }
+
+    function renderFilterPills() {
+      const all = state.clones;
+      const counts = {
+        all: all.length,
+        live: all.filter(c => c.running).length,
+        rea: all.filter(c => c.hasRea).length,
+        verified: all.filter(c => c.hasAudit).length,
+        cdp: all.filter(c => c.engine === 'cdp').length,
+        static: all.filter(c => c.engine === 'static').length
+      };
+      const defs = [
+        { key: 'all', label: 'All' },
+        { key: 'live', label: 'Live' },
+        { key: 'rea', label: 'REA Analyzed' },
+        { key: 'verified', label: 'Verified' },
+        { key: 'cdp', label: 'CDP' },
+        { key: 'static', label: 'Static' }
+      ];
+      document.getElementById('filterPills').innerHTML = defs.map(d => {
+        const active = state.filter === d.key;
+        const style = active
+          ? 'background: var(--text); color: var(--bg); border-color: var(--text);'
+          : 'background: var(--bg-elevated); color: var(--text-muted); border-color: var(--border);';
+        return '<button onclick="setFilter(\\'' + d.key + '\\')" class="spring-btn px-3 py-1.5 rounded-full text-xs font-medium border tabular-nums" style="' + style + '">'
+          + d.label + ' <span class="opacity-70 ml-1">' + counts[d.key] + '</span></button>';
+      }).join('');
+    }
+
+    function getFilteredClones() {
+      const q = (document.getElementById('searchInput')?.value || '').trim().toLowerCase();
+      const sort = document.getElementById('sortSelect')?.value || 'name';
+
+      const filtered = state.clones.filter(c => {
+        if (state.filter === 'live' && !c.running) return false;
+        if (state.filter === 'rea' && !c.hasRea) return false;
+        if (state.filter === 'verified' && !c.hasAudit) return false;
+        if (state.filter === 'cdp' && c.engine !== 'cdp') return false;
+        if (state.filter === 'static' && c.engine !== 'static') return false;
+        if (q) {
+          const hay = (c.name + ' ' + (c.targetUrl || '') + ' ' + (c.description || '')).toLowerCase();
+          if (!hay.includes(q)) return false;
+        }
+        return true;
+      });
+
+      filtered.sort((a, b) => {
+        if (sort === 'size') return (b.metrics?.totalBytes || 0) - (a.metrics?.totalBytes || 0);
+        if (sort === 'assets') return (b.metrics?.assetCount || 0) - (a.metrics?.assetCount || 0);
+        if (sort === 'port') return (a.port || 0) - (b.port || 0);
+        return a.name.localeCompare(b.name);
+      });
+
+      return filtered;
+    }
+
+    function renderBadge(label, tone) {
+      let style = 'background: var(--bg-subtle); color: var(--text-muted); border: 1px solid var(--border);';
+      if (tone === 'ok') style = 'background: var(--ok-soft); color: var(--ok); border: 1px solid var(--ok);';
+      if (tone === 'accent') style = 'background: var(--accent-soft); color: var(--accent); border: 1px solid var(--accent);';
+      if (tone === 'danger') style = 'background: var(--danger-soft); color: var(--danger); border: 1px solid var(--danger);';
+      return '<span class="font-mono text-[10px] px-1.5 py-0.5 rounded uppercase" style="' + style + '">' + escapeHtml(label) + '</span>';
+    }
+
+    function renderClones() {
+      const container = document.getElementById('catalogContainer');
+      const items = getFilteredClones();
+
+      if (items.length === 0) {
+        container.innerHTML = '<div class="surface rounded-2xl p-12 text-center space-y-2">'
+          + '<div class="font-display text-xl font-medium">No matching clones</div>'
+          + '<div class="text-xs" style="color: var(--text-muted);">Capture a live URL above or clear your active search filters.</div>'
+          + '</div>';
+        return;
+      }
+
+      if (state.viewMode === 'table') {
+        const rows = items.map(c => {
+          const m = c.metrics || {};
+          const safeName = escapeHtml(c.name);
+          const jsName = c.name.replace(/'/g, "\\\\'");
+          const auditLabel = c.hasAudit ? (m.passed ? renderBadge('PASS', 'ok') : renderBadge('WARN', 'danger')) : renderBadge('UNVERIFIED', 'neutral');
+          return '<tr style="border-top: 1px solid var(--border);" class="hover:opacity-95">'
+            + '<td class="py-3 px-4"><button onclick="openInspector(\\'' + jsName + '\\')" class="font-medium hover:underline text-left">' + safeName + '</button>'
+            + '<div class="font-mono text-[11px] truncate max-w-xs" style="color: var(--text-dim);">' + escapeHtml(c.targetUrl || '') + '</div></td>'
+            + '<td class="py-3 px-3 font-mono text-xs uppercase">' + escapeHtml(c.engine) + '</td>'
+            + '<td class="py-3 px-3 font-mono text-xs tabular-nums">:' + c.port + (c.running ? ' ' + renderBadge('LIVE', 'ok') : '') + '</td>'
+            + '<td class="py-3 px-3 font-mono text-xs tabular-nums">' + m.assetCount + ' (' + formatBytes(m.totalBytes) + ')</td>'
+            + '<td class="py-3 px-3 font-mono text-xs tabular-nums">' + (c.hasRea ? (m.routesCount + ' routes / ' + m.nodeCount + ' nodes') : '—') + '</td>'
+            + '<td class="py-3 px-3">' + auditLabel + '</td>'
+            + '<td class="py-3 px-4 text-right space-x-1.5 whitespace-nowrap">'
+            + '<button onclick="toggleServer(\\'' + jsName + '\\', ' + c.running + ')" class="spring-btn px-2 py-1 rounded text-[11px] font-mono" style="background: var(--bg-subtle); border: 1px solid var(--border);">' + (c.running ? 'Stop' : 'Start') + '</button>'
+            + '<button onclick="openInspector(\\'' + jsName + '\\')" class="spring-btn px-2 py-1 rounded text-[11px] font-mono" style="background: var(--bg-subtle); border: 1px solid var(--border);">Inspect</button>'
+            + '</td></tr>';
+        }).join('');
+
+        container.innerHTML = '<div class="surface rounded-2xl overflow-x-auto">'
+          + '<table class="w-full text-left border-collapse text-xs">'
+          + '<thead><tr style="color: var(--text-dim);" class="font-mono text-[11px] uppercase">'
+          + '<th class="py-3 px-4">Project</th><th class="py-3 px-3">Engine</th><th class="py-3 px-3">Port</th>'
+          + '<th class="py-3 px-3">Assets</th><th class="py-3 px-3">REA</th><th class="py-3 px-3">Audit</th><th class="py-3 px-4 text-right">Actions</th>'
+          + '</tr></thead><tbody>' + rows + '</tbody></table></div>';
+        return;
+      }
+
+      container.innerHTML = '<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">' + items.map(c => {
+        const m = c.metrics || {};
+        const safeName = escapeHtml(c.name);
+        const jsName = c.name.replace(/'/g, "\\\\'");
+        const shot = c.hasScreenshot
+          ? '<div onclick="openInspector(\\'' + jsName + '\\')" class="cursor-pointer overflow-hidden" style="border-bottom: 1px solid var(--border);">'
+            + '<img src="/screenshot/' + encodeURIComponent(c.name) + '" alt="' + safeName + '" class="w-full h-36 object-cover bg-black/20" loading="lazy" /></div>'
+          : '';
+        const swatches = (c.palette || []).map(col =>
+          '<span title="' + escapeHtml(col) + '" class="inline-block w-3 h-3 rounded-full" style="background:' + escapeHtml(col) + '; border: 1px solid var(--border-strong);"></span>'
+        ).join('');
+
+        return '<div class="surface card-apple rounded-2xl overflow-hidden flex flex-col justify-between">'
+          + '<div>' + shot + '<div class="p-4 space-y-3">'
+          + '<div class="flex items-center justify-between gap-2">'
+          + '<div class="flex flex-wrap items-center gap-1">'
+          + renderBadge(c.engine, 'neutral')
+          + (c.hasRea ? renderBadge('REA', 'accent') : '')
+          + (c.hasAudit ? renderBadge(m.passed ? 'PASS' : 'WARN', m.passed ? 'ok' : 'danger') : '')
+          + (c.running ? renderBadge('LIVE', 'ok') : '')
+          + '</div>'
+          + '<button onclick="copyText(\\'http://localhost:' + c.port + '\\', this)" title="Copy local URL" class="font-mono text-xs tabular-nums hover:underline" style="color: var(--accent);">:' + c.port + '</button>'
+          + '</div>'
+          + '<div>'
+          + '<h3 onclick="openInspector(\\'' + jsName + '\\')" class="text-sm font-semibold cursor-pointer hover:underline truncate">' + safeName + '</h3>'
+          + '<div class="font-mono text-[11px] truncate mt-0.5" style="color: var(--text-dim);">' + escapeHtml(c.targetUrl || c.description || 'Local workspace capture') + '</div>'
+          + '</div>'
+          + '<div class="grid grid-cols-3 gap-2 pt-1 font-mono text-[11px] tabular-nums" style="color: var(--text-muted);">'
+          + '<div><span style="color: var(--text-dim);" class="block text-[10px]">ASSETS</span>' + m.assetCount + '</div>'
+          + '<div><span style="color: var(--text-dim);" class="block text-[10px]">SIZE</span>' + formatBytes(m.totalBytes) + '</div>'
+          + '<div><span style="color: var(--text-dim);" class="block text-[10px]">REA</span>' + (c.hasRea ? (m.routesCount + 'R / ' + m.endpointsCount + 'E') : '—') + '</div>'
+          + '</div>'
+          + (swatches ? '<div class="flex items-center gap-1.5 pt-1">' + swatches + '</div>' : '')
+          + '</div></div>'
+          + '<div class="px-4 py-2.5 flex items-center justify-between gap-1.5 text-xs" style="border-top: 1px solid var(--border); background: var(--bg);">'
+          + '<div class="flex items-center gap-1.5">'
+          + '<button onclick="toggleServer(\\'' + jsName + '\\', ' + c.running + ')" class="spring-btn px-2.5 py-1 rounded-lg font-medium" style="background:' + (c.running ? 'var(--danger-soft)' : 'var(--ok-soft)') + '; color:' + (c.running ? 'var(--danger)' : 'var(--ok)') + '; border: 1px solid ' + (c.running ? 'var(--danger)' : 'var(--ok)') + ';">' + (c.running ? 'Stop' : 'Start') + '</button>'
+          + '<button onclick="openInspector(\\'' + jsName + '\\')" class="spring-btn px-2.5 py-1 rounded-lg font-medium" style="background: var(--bg-subtle); border: 1px solid var(--border);">Inspect</button>'
+          + '<button onclick="analyzeClone(\\'' + jsName + '\\', this)" class="spring-btn px-2 py-1 rounded-lg font-mono text-[11px]" style="background: var(--accent-soft); color: var(--accent); border: 1px solid var(--accent);">REA</button>'
+          + '<button onclick="verifyProject(\\'' + jsName + '\\', this)" class="spring-btn px-2 py-1 rounded-lg font-mono text-[11px]" style="background: var(--bg-subtle); border: 1px solid var(--border);">Verify</button>'
+          + '</div>'
+          + '<a href="http://localhost:' + c.port + '" target="_blank" class="spring-btn px-2.5 py-1 rounded-lg font-medium" style="background: var(--text); color: var(--bg);">Open</a>'
+          + '</div></div>';
+      }).join('') + '</div>';
+    }
+
     async function loadClones() {
       try {
         const res = await fetch('/api/clones');
         const data = await res.json();
-        const grid = document.getElementById('grid');
-        const count = document.getElementById('cloneCount');
-        count.textContent = data.clones.length + ' clones detected';
-
-        grid.innerHTML = data.clones.map(c => \`
-          <div class="rounded-2xl border border-white/10 bg-stone-900/40 overflow-hidden flex flex-col justify-between hover:border-white/20 transition group">
-            <div>
-              \${c.hasScreenshot ? \`<img src="/screenshot/\${encodeURIComponent(c.name)}" alt="\${c.name}" class="w-full h-36 object-cover border-b border-white/10 bg-black/40" loading="lazy" />\` : ''}
-              <div class="p-5 pb-3">
-                <div class="flex items-center justify-between text-xs text-stone-400 mb-2">
-                  <div class="flex items-center gap-1.5">
-                    <span class="px-2 py-0.5 rounded bg-white/5 border border-white/10 font-mono text-[10px]">\${c.source}</span>
-                    \${c.hasRea ? '<span class="px-2 py-0.5 rounded bg-amber-500/15 border border-amber-500/30 text-amber-300 font-mono text-[10px]">REA</span>' : ''}
-                    \${c.running ? '<span class="px-2 py-0.5 rounded bg-emerald-500/15 border border-emerald-500/30 text-emerald-400 font-mono text-[10px]">LIVE</span>' : ''}
-                  </div>
-                  <span class="font-mono text-amber-400">Port :\${c.port}</span>
-                </div>
-                <h3 class="text-base font-semibold text-white tracking-tight group-hover:text-amber-300 transition">\${c.name}</h3>
-                <p class="text-xs text-stone-400 mt-1 line-clamp-2 leading-relaxed">\${c.description || 'Full 1:1 reconstruction with autonomous proxy fallback.'}</p>
-              </div>
-            </div>
-
-            <div class="px-5 py-3 border-t border-white/5 flex items-center justify-between gap-2 text-xs">
-              <div class="flex items-center gap-1.5">
-                <button
-                  onclick="toggleServer('\${c.name}', \${c.running})"
-                  class="px-2.5 py-1.5 rounded-lg border font-medium transition text-xs \${c.running ? 'border-rose-500/30 bg-rose-500/10 text-rose-300 hover:bg-rose-500/20' : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20'}"
-                >
-                  \${c.running ? 'Stop' : 'Start'}
-                </button>
-                <button
-                  onclick="analyzeClone('\${c.name}', this)"
-                  class="px-2.5 py-1.5 rounded-lg border border-amber-400/30 bg-amber-400/10 text-amber-300 hover:bg-amber-400/20 font-medium transition text-xs"
-                >
-                  Analyze (REA)
-                </button>
-              </div>
-              <a href="http://localhost:\${c.port}" target="_blank" class="px-3 py-1.5 rounded-lg bg-white/10 hover:bg-white text-white hover:text-stone-950 font-medium transition text-xs">
-                Launch →
-              </a>
-            </div>
-          </div>
-        \`).join('');
+        state.clones = data.clones || [];
+        renderFilterPills();
+        renderClones();
+        updateOnboarding();
       } catch (err) {
         console.error(err);
       }
     }
 
-    async function analyzeClone(name, btn) {
+    function showNotice(msg) {
       const notice = document.getElementById('statusNotice');
-      const prev = btn.textContent;
-      btn.disabled = true;
-      btn.textContent = 'Analyzing...';
       notice.classList.remove('hidden');
-      notice.textContent = 'Running REA static JS application analysis for ' + name + '...';
+      notice.textContent = msg;
+    }
+
+    async function copyText(text, btn) {
+      try {
+        await navigator.clipboard.writeText(text);
+        if (btn) {
+          const prev = btn.textContent;
+          btn.textContent = 'Copied';
+          setTimeout(() => { btn.textContent = prev; }, 1200);
+        }
+      } catch {}
+    }
+
+    async function toggleServer(name, isRunning) {
+      setPipelineStage(4, [1, 2, 3]);
+      await fetch('/api/serve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, action: isRunning ? 'stop' : 'start' })
+      });
+      await loadClones();
+      setPipelineStage(0, isRunning ? [] : [4]);
+    }
+
+    async function triggerClone(e) {
+      e.preventDefault();
+      const targetUrl = document.getElementById('urlInput').value;
+      const name = document.getElementById('nameInput').value;
+      const engine = document.getElementById('engineSelect').value;
+      const rea = document.getElementById('reaCheck').checked;
+      const fetchSourceMaps = document.getElementById('sourceMapsCheck').checked;
+      const btn = document.getElementById('submitBtn');
+
+      btn.disabled = true;
+      btn.textContent = 'Capturing...';
+      setPipelineStage(2, [1]);
+      showNotice('Capturing ' + targetUrl + ' via ' + engine.toUpperCase() + (rea && engine === 'cdp' ? ' + REA' : '') + '...');
+
+      try {
+        const res = await fetch('/api/clone', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ targetUrl, name, engine, rea, fetchSourceMaps })
+        });
+        const d = await res.json();
+        if (!res.ok) throw new Error(d.error || 'Clone failed');
+        setPipelineStage(rea ? 3 : 4, [1, 2]);
+        showNotice('Pipeline started for "' + d.slug + '" on port :' + d.port + '. Polling workspace...');
+        setTimeout(() => {
+          loadClones();
+          btn.disabled = false;
+          btn.textContent = 'Start Capture';
+          setPipelineStage(0, [1, 2, 3, 4]);
+        }, 4500);
+      } catch (err) {
+        showNotice('Capture error: ' + err.message);
+        btn.disabled = false;
+        btn.textContent = 'Start Capture';
+      }
+    }
+
+    async function analyzeClone(name, btn) {
+      const prev = btn ? btn.textContent : '';
+      if (btn) { btn.disabled = true; btn.textContent = '...'; }
+      setPipelineStage(3, [1, 2]);
+      showNotice('Running REA offline JavaScript application graph analysis for "' + name + '"...');
       try {
         const res = await fetch('/api/analyze', {
           method: 'POST',
@@ -412,70 +1114,299 @@ const server = http.createServer(async (req, res) => {
           body: JSON.stringify({ name })
         });
         const d = await res.json();
-        if (!res.ok || d.error) throw new Error(d.error || 'Analysis failed');
-        notice.textContent = 'REA analyzed ' + d.summary.analyzedModuleCount + ' module(s) (' + d.summary.nodeCount + ' nodes, ' + d.summary.edgeCount + ' edges) -> saved rea-analysis.json';
+        if (!res.ok || d.error) throw new Error(d.error || 'REA analysis failed');
+        setPipelineStage(0, [1, 2, 3]);
+        showNotice('REA analyzed ' + d.summary.analyzedModuleCount + ' modules (' + d.summary.nodeCount + ' nodes, ' + d.summary.edgeCount + ' edges) for "' + name + '".');
         await loadClones();
+        if (state.inspector.open && state.inspector.name === name) {
+          await openInspector(name, state.inspector.tab);
+        }
       } catch (err) {
-        notice.textContent = 'REA Error: ' + err.message;
+        showNotice('REA error: ' + err.message);
       } finally {
-        btn.disabled = false;
-        btn.textContent = prev;
+        if (btn) { btn.disabled = false; btn.textContent = prev; }
       }
     }
 
-    async function toggleServer(name, isRunning) {
+    async function verifyProject(name, btn) {
+      const prev = btn ? btn.textContent : '';
+      if (btn) { btn.disabled = true; btn.textContent = '...'; }
+      setPipelineStage(4, [1, 2, 3]);
+      showNotice('Running desktop (1440x900) and mobile (390x844) headless audit for "' + name + '"...');
       try {
-        await fetch('/api/serve', {
+        const res = await fetch('/api/verify', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name, action: isRunning ? 'stop' : 'start' })
-        });
-        await loadClones();
-      } catch (err) {
-        console.error(err);
-      }
-    }
-
-    async function triggerClone(e) {
-      e.preventDefault();
-      const url = document.getElementById('urlInput').value;
-      const name = document.getElementById('nameInput').value;
-      const engine = document.getElementById('engineSelect').value;
-      const rea = document.getElementById('reaCheck').checked;
-      const btn = document.getElementById('submitBtn');
-      const notice = document.getElementById('statusNotice');
-
-      btn.disabled = true;
-      btn.textContent = 'Ingesting Pipeline...';
-      notice.classList.remove('hidden');
-      notice.textContent = 'Running ' + engine.toUpperCase() + ' capture for ' + url + '...';
-
-      try {
-        const res = await fetch('/api/clone', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ targetUrl: url, name: name, engine: engine, rea: rea })
+          body: JSON.stringify({ name })
         });
         const d = await res.json();
-        notice.textContent = 'Clone pipeline initialized for ' + d.slug + ' on port ' + d.port + ' (' + d.engine + ')! Refreshing...';
-        setTimeout(() => {
-          loadClones();
-          btn.disabled = false;
-          btn.textContent = 'Clone Experience';
-          notice.classList.add('hidden');
-        }, 4000);
+        if (!res.ok || d.error) throw new Error(d.error || 'Verification failed');
+        setPipelineStage(0, [1, 2, 3, 4]);
+        showNotice('Audit for "' + name + '": ' + (d.report.passed ? 'PASSED' : 'ISSUES DETECTED') + ' (console: ' + d.report.consoleErrors.length + ', network: ' + d.report.networkErrors.length + ').');
+        await loadClones();
+        if (state.inspector.open && state.inspector.name === name) {
+          await openInspector(name, 'audit');
+        }
       } catch (err) {
-        notice.textContent = 'Error: ' + err.message;
-        btn.disabled = false;
-        btn.textContent = 'Clone Experience';
+        showNotice('Verify error: ' + err.message);
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = prev; }
       }
     }
 
+    function runFirstMissingRea() {
+      const target = state.clones.find(c => !c.hasRea) || state.clones[0];
+      if (!target) { focusCapture(); return; }
+      analyzeClone(target.name);
+    }
+
+    function runFirstMissingVerify() {
+      const target = state.clones.find(c => !c.hasAudit) || state.clones[0];
+      if (!target) { focusCapture(); return; }
+      verifyProject(target.name);
+    }
+
+    /* Notion Side-Peek Inspector Drawer */
+    async function openInspector(name, tab) {
+      state.inspector.open = true;
+      state.inspector.name = name;
+      if (tab) state.inspector.tab = tab;
+      document.getElementById('drawerBackdrop').classList.add('open');
+      document.getElementById('inspectorDrawer').classList.add('open');
+      document.getElementById('drawerTitle').textContent = name;
+      document.getElementById('drawerBody').innerHTML = '<div class="font-mono" style="color: var(--text-muted);">Loading telemetry...</div>';
+
+      try {
+        const res = await fetch('/api/inspect?name=' + encodeURIComponent(name));
+        const data = await res.json();
+        state.inspector.data = data;
+        document.getElementById('drawerPortBadge').textContent = ':' + data.clone.port;
+        document.getElementById('drawerUrl').textContent = data.clone.targetUrl || data.clone.path;
+        setInspectorTab(state.inspector.tab);
+      } catch (err) {
+        document.getElementById('drawerBody').innerHTML = '<div style="color: var(--danger);">' + escapeHtml(err.message) + '</div>';
+      }
+    }
+
+    function closeInspector() {
+      state.inspector.open = false;
+      document.getElementById('drawerBackdrop').classList.remove('open');
+      document.getElementById('inspectorDrawer').classList.remove('open');
+    }
+
+    function setInspectorTab(tab) {
+      state.inspector.tab = tab;
+      document.querySelectorAll('.inspector-tab').forEach(btn => {
+        const active = btn.getAttribute('data-tab') === tab;
+        btn.style.borderColor = active ? 'var(--accent)' : 'transparent';
+        btn.style.color = active ? 'var(--text)' : 'var(--text-muted)';
+      });
+      renderInspectorBody();
+    }
+
+    function setAuditViewport(vp) {
+      state.inspector.viewport = vp;
+      renderInspectorBody();
+    }
+
+    function renderInspectorBody() {
+      const body = document.getElementById('drawerBody');
+      const d = state.inspector.data;
+      if (!d) return;
+      const c = d.clone;
+      const jsName = c.name.replace(/'/g, "\\\\'");
+
+      if (state.inspector.tab === 'overview') {
+        const m = d.manifest || {};
+        const page = m.page || {};
+        const colors = (page.colors || []).map(col =>
+          '<div class="flex items-center gap-2 px-2 py-1 rounded-lg" style="background: var(--bg-elevated); border: 1px solid var(--border);">'
+          + '<span class="w-3.5 h-3.5 rounded-full" style="background:' + escapeHtml(col) + ';"></span>'
+          + '<span class="font-mono text-[11px]">' + escapeHtml(col) + '</span></div>'
+        ).join('');
+        const fonts = (page.fonts || []).map(f => '<div class="font-mono text-[11px] py-1">' + escapeHtml(f) + '</div>').join('');
+        const cssVars = Object.entries(page.cssVariables || {}).slice(0, 15).map(([k, v]) =>
+          '<tr style="border-top: 1px solid var(--border);"><td class="py-1.5 pr-3 font-mono text-[11px]" style="color: var(--accent);">' + escapeHtml(k) + '</td><td class="py-1.5 font-mono text-[11px]">' + escapeHtml(v) + '</td></tr>'
+        ).join('');
+
+        body.innerHTML =
+          '<div class="grid grid-cols-4 gap-3">'
+          + '<div class="surface p-3 rounded-xl"><div class="text-[10px] font-mono" style="color: var(--text-dim);">DOM</div><div class="font-mono text-sm font-semibold tabular-nums mt-0.5">' + formatBytes(m.domBytes || 0) + '</div></div>'
+          + '<div class="surface p-3 rounded-xl"><div class="text-[10px] font-mono" style="color: var(--text-dim);">ASSETS</div><div class="font-mono text-sm font-semibold tabular-nums mt-0.5">' + (m.assetCount || 0) + '</div></div>'
+          + '<div class="surface p-3 rounded-xl"><div class="text-[10px] font-mono" style="color: var(--text-dim);">TRACKERS</div><div class="font-mono text-sm font-semibold tabular-nums mt-0.5">' + (m.skippedTrackers || 0) + ' skipped</div></div>'
+          + '<div class="surface p-3 rounded-xl"><div class="text-[10px] font-mono" style="color: var(--text-dim);">CDNS</div><div class="font-mono text-sm font-semibold tabular-nums mt-0.5">' + ((m.externalHosts || []).length) + '</div></div>'
+          + '</div>'
+          + '<div><div class="font-medium mb-2">Extracted palette</div><div class="flex flex-wrap gap-2">' + (colors || '<span style="color: var(--text-dim);">No manifest palette recorded yet.</span>') + '</div></div>'
+          + '<div><div class="font-medium mb-2">Fonts</div>' + (fonts || '<span style="color: var(--text-dim);">None recorded.</span>') + '</div>'
+          + (cssVars ? '<div><div class="font-medium mb-2">CSS custom properties</div><table class="w-full">' + cssVars + '</table></div>' : '');
+        return;
+      }
+
+      if (state.inspector.tab === 'rea') {
+        const rb = d.reaBundle;
+        const ra = d.reaAnalysis;
+        const routes = (rb?.routes || []).map(r => '<span class="font-mono text-[11px] px-2 py-0.5 rounded" style="background: var(--bg-subtle); border: 1px solid var(--border);">' + escapeHtml(r) + '</span>').join(' ');
+        const endpoints = (rb?.endpoints || []).map(ep => '<span class="font-mono text-[11px] px-2 py-0.5 rounded" style="background: var(--accent-soft); color: var(--accent); border: 1px solid var(--accent);">' + escapeHtml(ep) + '</span>').join(' ');
+        const chunks = (rb?.chunks || []).slice(0, 12).map(ch =>
+          '<tr style="border-top: 1px solid var(--border);"><td class="py-1.5 pr-2 font-mono text-[11px] truncate max-w-xs">' + escapeHtml(ch.url) + '</td><td class="py-1.5 pr-2 font-mono text-[11px] tabular-nums">' + formatBytes(ch.bytes) + '</td><td class="py-1.5 font-mono text-[10px]" style="color: var(--text-dim);">' + escapeHtml((ch.sha256 || '').slice(0, 12)) + '</td></tr>'
+        ).join('');
+        const families = (ra?.semanticFamilies || []).map(f =>
+          '<span class="font-mono text-[11px] px-2 py-0.5 rounded" style="background: var(--bg-subtle); border: 1px solid var(--border);">' + escapeHtml(f.family) + ': ' + f.retainedRelations + '</span>'
+        ).join(' ');
+
+        body.innerHTML =
+          '<div class="flex items-center justify-between gap-2">'
+          + '<div>' + (ra?.evidenceId ? '<span class="font-mono text-[11px]" style="color: var(--text-dim);">Evidence: ' + escapeHtml(ra.evidenceId.slice(0, 20)) + '...</span>' : 'No offline JS graph saved yet.') + '</div>'
+          + '<button onclick="analyzeClone(\\'' + jsName + '\\', this)" class="spring-btn px-3 py-1.5 rounded-lg font-medium" style="background: var(--accent); color: var(--accent-fg);">Run Offline REA Analysis</button>'
+          + '</div>'
+          + (ra ? '<div class="grid grid-cols-3 gap-3"><div class="surface p-3 rounded-xl"><div class="text-[10px] font-mono" style="color: var(--text-dim);">NODES</div><div class="font-mono text-sm font-semibold tabular-nums">' + ra.nodeCount + '</div></div><div class="surface p-3 rounded-xl"><div class="text-[10px] font-mono" style="color: var(--text-dim);">EDGES</div><div class="font-mono text-sm font-semibold tabular-nums">' + ra.edgeCount + '</div></div><div class="surface p-3 rounded-xl"><div class="text-[10px] font-mono" style="color: var(--text-dim);">MODULES</div><div class="font-mono text-sm font-semibold tabular-nums">' + ra.analyzedModuleCount + '</div></div></div>' : '')
+          + '<div><div class="font-medium mb-1.5">Discovered routes (' + (rb?.routes?.length || 0) + ')</div><div class="flex flex-wrap gap-1.5">' + (routes || '<span style="color: var(--text-dim);">Run CDP capture with --rea to extract live routes.</span>') + '</div></div>'
+          + '<div><div class="font-medium mb-1.5">Auto-mocked API endpoints (' + (rb?.endpoints?.length || 0) + ')</div><div class="flex flex-wrap gap-1.5">' + (endpoints || '<span style="color: var(--text-dim);">No endpoints extracted.</span>') + '</div></div>'
+          + (families ? '<div><div class="font-medium mb-1.5">Semantic families</div><div class="flex flex-wrap gap-1.5">' + families + '</div></div>' : '')
+          + (chunks ? '<div><div class="font-medium mb-1.5">Captured script chunks</div><table class="w-full">' + chunks + '</table></div>' : '');
+        return;
+      }
+
+      if (state.inspector.tab === 'audit') {
+        const ar = d.auditReport;
+        const vp = state.inspector.viewport;
+        const imgUrl = '/audit-image/' + vp + '/' + encodeURIComponent(c.name) + '?t=' + Date.now();
+        const errorsList = (ar?.consoleErrors || []).concat(ar?.networkErrors || []).map(e =>
+          '<div class="font-mono text-[11px] p-2 rounded" style="background: var(--danger-soft); color: var(--danger);">' + escapeHtml(e) + '</div>'
+        ).join('');
+
+        body.innerHTML =
+          '<div class="flex items-center justify-between gap-2">'
+          + '<div class="inline-flex rounded-lg p-0.5" style="background: var(--bg-elevated); border: 1px solid var(--border);">'
+          + '<button onclick="setAuditViewport(\\'desktop\\')" class="px-3 py-1 rounded-md text-xs font-medium" style="background:' + (vp === 'desktop' ? 'var(--bg-subtle)' : 'transparent') + ';">Desktop 1440×900</button>'
+          + '<button onclick="setAuditViewport(\\'mobile\\')" class="px-3 py-1 rounded-md text-xs font-medium" style="background:' + (vp === 'mobile' ? 'var(--bg-subtle)' : 'transparent') + ';">Mobile 390×844</button>'
+          + '</div>'
+          + '<button onclick="verifyProject(\\'' + jsName + '\\', this)" class="spring-btn px-3 py-1.5 rounded-lg font-medium" style="background: var(--accent); color: var(--accent-fg);">Run Verify Audit</button>'
+          + '</div>'
+          + (ar ? '<div class="grid grid-cols-4 gap-3"><div class="surface p-3 rounded-xl"><div class="text-[10px] font-mono" style="color: var(--text-dim);">STATUS</div><div class="font-mono text-sm font-semibold" style="color:' + (ar.passed ? 'var(--ok)' : 'var(--danger)') + ';">' + (ar.passed ? 'PASS' : 'ISSUES') + '</div></div><div class="surface p-3 rounded-xl"><div class="text-[10px] font-mono" style="color: var(--text-dim);">CONSOLE ERR</div><div class="font-mono text-sm font-semibold tabular-nums">' + ar.consoleErrors.length + '</div></div><div class="surface p-3 rounded-xl"><div class="text-[10px] font-mono" style="color: var(--text-dim);">HTTP 4xx/5xx</div><div class="font-mono text-sm font-semibold tabular-nums">' + ar.networkErrors.length + '</div></div><div class="surface p-3 rounded-xl"><div class="text-[10px] font-mono" style="color: var(--text-dim);">BROKEN IMG</div><div class="font-mono text-sm font-semibold tabular-nums">' + (ar.desktop?.brokenImages ?? 0) + ' / ' + (ar.mobile?.brokenImages ?? 0) + '</div></div></div>' : '<div style="color: var(--text-muted);">No audit-report.json yet. Run Verify Audit to test console errors, broken images, and mobile overflow.</div>')
+          + '<div class="rounded-xl overflow-hidden" style="border: 1px solid var(--border);"><img src="' + imgUrl + '" alt="Audit viewport preview" class="w-full h-auto bg-black/20" onerror="this.style.display=\\'none\\'" /></div>'
+          + (errorsList ? '<div class="space-y-1.5"><div class="font-medium">Deduplicated issues</div>' + errorsList + '</div>' : '');
+        return;
+      }
+
+      if (state.inspector.tab === 'cli') {
+        const cmds = [
+          { label: 'Serve locally', cmd: 'node src/cli.js serve ' + c.name + ' --port ' + c.port },
+          { label: 'REA static JS analysis', cmd: 'node src/cli.js analyze ' + c.name + ' --json' },
+          { label: 'Headless verify audit', cmd: 'node src/cli.js verify ' + c.name + ' --port ' + c.port }
+        ];
+        if (c.targetUrl) {
+          cmds.unshift({ label: 'Re-capture with CDP + REA', cmd: 'node src/cli.js capture ' + c.targetUrl + ' ' + c.name + ' --rea' });
+        }
+        body.innerHTML = '<div class="space-y-3">' + cmds.map(item =>
+          '<div class="surface p-3 rounded-xl flex items-center justify-between gap-3">'
+          + '<div class="min-w-0"><div class="text-[11px] font-medium mb-1">' + escapeHtml(item.label) + '</div>'
+          + '<code class="font-mono text-[11px] break-all" style="color: var(--text-muted);">' + escapeHtml(item.cmd) + '</code></div>'
+          + '<button onclick="copyText(\\'' + escapeHtml(item.cmd).replace(/'/g, "\\\\'") + '\\', this)" class="spring-btn shrink-0 px-2.5 py-1 rounded-lg font-mono text-[11px]" style="background: var(--bg-subtle); border: 1px solid var(--border);">Copy</button>'
+          + '</div>'
+        ).join('') + '</div>';
+      }
+    }
+
+    /* Linear Command Palette (Ctrl/Cmd + K) */
+    function buildPaletteCommands() {
+      const items = [
+        { title: 'Focus Capture URL input', hint: 'C', run: () => focusCapture() },
+        { title: 'Switch Theme (Linear Dark / Aesop Light)', hint: 'T', run: () => toggleTheme() },
+        { title: 'Toggle Gallery / Table View', hint: 'View', run: () => setViewMode(state.viewMode === 'gallery' ? 'table' : 'gallery') },
+        { title: 'Filter: Live Running Servers', hint: 'Filter', run: () => setFilter('live') },
+        { title: 'Filter: All Clones', hint: 'Filter', run: () => setFilter('all') }
+      ];
+      state.clones.forEach(c => {
+        items.push({ title: 'Inspect ' + c.name, hint: 'Drawer', run: () => openInspector(c.name, 'overview') });
+        items.push({ title: 'Analyze ' + c.name + ' with REA', hint: 'REA', run: () => analyzeClone(c.name) });
+        items.push({ title: (c.running ? 'Stop' : 'Start') + ' ' + c.name + ' (:' + c.port + ')', hint: 'Server', run: () => toggleServer(c.name, c.running) });
+      });
+      return items;
+    }
+
+    function openCommandPalette() {
+      document.getElementById('cmdPalette').classList.add('open');
+      const inp = document.getElementById('paletteInput');
+      inp.value = '';
+      state.paletteIndex = 0;
+      renderPaletteItems();
+      setTimeout(() => inp.focus(), 10);
+    }
+
+    function closeCommandPalette() {
+      document.getElementById('cmdPalette').classList.remove('open');
+    }
+
+    function renderPaletteItems() {
+      const q = (document.getElementById('paletteInput').value || '').trim().toLowerCase();
+      const all = buildPaletteCommands().filter(item => !q || item.title.toLowerCase().includes(q));
+      const visible = all.slice(0, 12);
+      window._paletteVisible = visible;
+      if (state.paletteIndex >= visible.length) state.paletteIndex = 0;
+
+      document.getElementById('paletteList').innerHTML = visible.map((item, idx) => {
+        const active = idx === state.paletteIndex;
+        const style = active ? 'background: var(--accent-soft); color: var(--text);' : 'color: var(--text-muted);';
+        return '<button onclick="runPaletteItem(' + idx + ')" class="w-full text-left px-3 py-2 rounded-lg flex items-center justify-between text-xs" style="' + style + '">'
+          + '<span class="truncate">' + escapeHtml(item.title) + '</span>'
+          + '<span class="kbd-chip ml-2 shrink-0">' + escapeHtml(item.hint) + '</span></button>';
+      }).join('') || '<div class="p-4 text-center text-xs" style="color: var(--text-dim);">No matching commands</div>';
+    }
+
+    function runPaletteItem(idx) {
+      const item = (window._paletteVisible || [])[idx];
+      closeCommandPalette();
+      if (item && item.run) item.run();
+    }
+
+    document.addEventListener('keydown', (e) => {
+      const tag = (document.activeElement && document.activeElement.tagName || '').toLowerCase();
+      const inInput = tag === 'input' || tag === 'textarea' || tag === 'select';
+
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        if (document.getElementById('cmdPalette').classList.contains('open')) closeCommandPalette();
+        else openCommandPalette();
+        return;
+      }
+
+      if (e.key === 'Escape') {
+        if (document.getElementById('cmdPalette').classList.contains('open')) closeCommandPalette();
+        else if (state.inspector.open) closeInspector();
+        return;
+      }
+
+      if (document.getElementById('cmdPalette').classList.contains('open')) {
+        const visible = window._paletteVisible || [];
+        if (e.key === 'ArrowDown' && visible.length) {
+          e.preventDefault();
+          state.paletteIndex = (state.paletteIndex + 1) % visible.length;
+          renderPaletteItems();
+        } else if (e.key === 'ArrowUp' && visible.length) {
+          e.preventDefault();
+          state.paletteIndex = (state.paletteIndex - 1 + visible.length) % visible.length;
+          renderPaletteItems();
+        } else if (e.key === 'Enter' && visible[state.paletteIndex]) {
+          e.preventDefault();
+          runPaletteItem(state.paletteIndex);
+        }
+        return;
+      }
+
+      if (inInput) return;
+      if (e.key.toLowerCase() === 'c') { e.preventDefault(); focusCapture(); }
+      else if (e.key.toLowerCase() === 't') { e.preventDefault(); toggleTheme(); }
+      else if (e.key === '/') { e.preventDefault(); document.getElementById('searchInput').focus(); }
+    });
+
+    applyTheme(state.theme);
+    setViewMode(state.viewMode);
     loadClones();
   </script>
 </body>
-</html>`);
-});
+</html>`;
+}
 
 function shutdownServers() {
   for (const proc of activeServers.values()) {
@@ -490,7 +1421,7 @@ process.on('SIGTERM', shutdownServers);
 
 server.listen(PORT, () => {
   console.log(`\n=======================================================`);
-  console.log(`🌟 Mimic Studio Dashboard: http://localhost:${PORT}`);
+  console.log(`🌟 Mimic Studio: http://localhost:${PORT}`);
   console.log(`📁 Scanning Clones from:`);
   console.log(`   - ${CLONES_DIR}`);
   console.log(`   - ${LEGACY_CLONES_DIR}`);
