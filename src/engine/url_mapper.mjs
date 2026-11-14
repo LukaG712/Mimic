@@ -3,6 +3,7 @@
  * Accurately maps both same-origin assets and third-party CDNs to clean filesystem paths.
  */
 
+import crypto from 'crypto';
 import path from 'path';
 
 /**
@@ -11,9 +12,10 @@ import path from 'path';
  * @param {string} rawUrl - Full or relative asset URL
  * @param {string} baseUrl - Base root URL of the target site
  * @param {string} outputDir - Root output directory for the clone
+ * @param {string} [mimeType=''] - Optional HTTP MIME type of the response
  * @returns {{ diskPath: string, isExternal: boolean } | null}
  */
-export function mapUrlToFilePath(rawUrl, baseUrl, outputDir) {
+export function mapUrlToFilePath(rawUrl, baseUrl, outputDir, mimeType = '') {
   if (!rawUrl || typeof rawUrl !== 'string') return null;
 
   const trimmed = rawUrl.trim();
@@ -61,6 +63,17 @@ export function mapUrlToFilePath(rawUrl, baseUrl, outputDir) {
 
   if (segments.length === 0) {
     segments.push('index.html');
+  }
+
+  const lastIdx = segments.length - 1;
+  const lastSeg = segments[lastIdx];
+  if (!path.extname(lastSeg)) {
+    if (mimeType && mimeType.toLowerCase().includes('text/html')) {
+      segments[lastIdx] = `${lastSeg}.html`;
+    } else if (parsedUrl.search) {
+      const qHash = crypto.createHash('md5').update(parsedUrl.search).digest('hex').slice(0, 8);
+      segments[lastIdx] = `${lastSeg}_${qHash}`;
+    }
   }
 
   const isSameHost = parsedUrl.hostname === parsedBase.hostname;

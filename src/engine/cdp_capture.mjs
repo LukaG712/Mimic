@@ -13,6 +13,8 @@ import { mapUrlToFilePath } from './url_mapper.mjs';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const CHROME_PATH = process.env.CHROME_PATH || 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
+const MAX_CONCURRENCY = 10;
+const COMMAND_TIMEOUT_MS = 15000;
 
 export async function captureRuntime(targetUrl, outputDir, options = {}) {
   const width = options.width || 1440;
@@ -21,6 +23,7 @@ export async function captureRuntime(targetUrl, outputDir, options = {}) {
   const port = options.port || (9222 + Math.floor(Math.random() * 400));
   const doScroll = options.scroll !== false;
   const targetPort = options.targetPort || 3000;
+  const timeoutMs = options.timeout || 60000;
 
   console.log(`\n=======================================================`);
   console.log(`🤖 [Mimic CDP In-Flight Engine] Navigating: ${targetUrl}`);
@@ -44,115 +47,177 @@ export async function captureRuntime(targetUrl, outputDir, options = {}) {
     'about:blank'
   ]);
 
-  await new Promise(r => setTimeout(r, 1500));
-
   let ws;
-  let assetCount = 0;
-  let totalBytes = 0;
-  let domBytes = 0;
-  let screenshotBytes = 0;
+  let overallTimer;
+  let aborted = false;
+  const pendingRequests = new Map();
 
-  try {
+  const runCapture = async () => {
+    let assetCount = 0;
+    let totalBytes = 0;
+    let domBytes = 0;
+    let screenshotBytes = 0;
+
+    await new Promise(r => setTimeout(r, 1500));
+    if (aborted) return;
+
     const versionResp = await fetch(`http://127.0.0.1:${port}/json/version`);
+    if (aborted) return;
     const versionData = await versionResp.json();
     ws = new WebSocket(versionData.webSocketDebuggerUrl);
     await new Promise((resolve, reject) => {
       ws.onopen = resolve;
       ws.onerror = reject;
     });
+    if (aborted) return;
 
     let msgId = 1;
-    function send(method, params = {}) {
-      return new Promise((resolve) => {
+    let activeSessionId = null;
+    const pendingResponses = new Map();
+    const taskQueue = [];
+    let activeWorkers = 0;
+    let totalQueued = 0;
+    let drainResolvers = [];
+
+    function pumpQueue() {
+      while (activeWorkers < MAX_CONCURRENCY && taskQueue.length > 0) {
+        const job = taskQueue.shift();
+        activeWorkers++;
+        Promise.resolve()
+          .then(job)
+          .catch(() => {})
+          .finally(() => {
+            activeWorkers--;
+            pumpQueue();
+            if (activeWorkers === 0 && taskQueue.length === 0) {
+              const resolvers = drainResolvers.splice(0);
+              for (const res of resolvers) res();
+            }
+          });
+      }
+    }
+
+    function waitForQueueDrain(maxWaitMs = 15000) {
+      if (activeWorkers === 0 && taskQueue.length === 0) {
+        return Promise.resolve();
+      }
+      return Promise.race([
+        new Promise(resolve => drainResolvers.push(resolve)),
+        new Promise(resolve => setTimeout(resolve, maxWaitMs))
+      ]);
+    }
+
+    function sendCommand(method, params = {}, sessionId = undefined) {
+      return new Promise((resolve, reject) => {
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+          reject(new Error(`WebSocket closed before sending ${method}`));
+          return;
+        }
         const id = msgId++;
-        const handler = (event) => {
-          const data = JSON.parse(event.data);
-          if (data.id === id) {
-            ws.removeEventListener('message', handler);
-            resolve(data.result);
+        const timer = setTimeout(() => {
+          if (pendingRequests.has(id)) {
+            pendingRequests.delete(id);
+            reject(new Error(`CDP command timed out: ${method}`));
           }
-        };
-        ws.addEventListener('message', handler);
-        ws.send(JSON.stringify({ id, method, params }));
+        }, COMMAND_TIMEOUT_MS);
+
+        pendingRequests.set(id, { resolve, reject, timer });
+        const payload = sessionId ? { id, sessionId, method, params } : { id, method, params };
+        ws.send(JSON.stringify(payload));
       });
     }
 
-    const { targetId } = await send('Target.createTarget', { url: 'about:blank' });
-    const { sessionId } = await send('Target.attachToTarget', { targetId, flatten: true });
+    function send(method, params = {}) {
+      return sendCommand(method, params);
+    }
 
     function sendSession(method, params = {}) {
-      return new Promise((resolve, reject) => {
-        const id = msgId++;
-        const handler = (event) => {
-          const data = JSON.parse(event.data);
-          if (data.id === id) {
-            ws.removeEventListener('message', handler);
-            if (data.error) {
-              reject(new Error(data.error.message || 'CDP Error'));
-            } else {
-              resolve(data.result);
-            }
-          }
-        };
-        ws.addEventListener('message', handler);
-        ws.send(JSON.stringify({ id, sessionId, method, params }));
-      });
+      return sendCommand(method, params, activeSessionId);
     }
 
-    // Set up in-flight asset capture listeners
-    const pendingResponses = new Map();
-    const downloadQueue = [];
-
+    // Single centralized O(1) WebSocket message dispatcher
     ws.addEventListener('message', (event) => {
+      let data;
       try {
-        const data = JSON.parse(event.data);
-        if (data.sessionId !== sessionId) return;
+        data = JSON.parse(event.data);
+      } catch {
+        return;
+      }
 
-        if (data.method === 'Network.responseReceived') {
-          const { requestId, response } = data.params;
-          if (response && (response.status === 200 || response.status === 206)) {
-            const assetUrl = response.url;
-            if (assetUrl && !assetUrl.startsWith('data:') && !assetUrl.startsWith('blob:')) {
-              pendingResponses.set(requestId, {
-                url: assetUrl,
-                mimeType: response.mimeType || 'application/octet-stream',
-                status: response.status
-              });
-            }
-          }
-        } else if (data.method === 'Network.loadingFinished') {
-          const { requestId } = data.params;
-          const info = pendingResponses.get(requestId);
-          if (info) {
-            pendingResponses.delete(requestId);
-            const task = (async () => {
-              try {
-                const bodyRes = await sendSession('Network.getResponseBody', { requestId });
-                if (bodyRes && bodyRes.body) {
-                  const mapped = mapUrlToFilePath(info.url, targetUrl, outputDir);
-                  if (mapped && mapped.diskPath) {
-                    const buf = bodyRes.base64Encoded
-                      ? Buffer.from(bodyRes.body, 'base64')
-                      : Buffer.from(bodyRes.body, 'utf-8');
-                    fs.mkdirSync(path.dirname(mapped.diskPath), { recursive: true });
-                    fs.writeFileSync(mapped.diskPath, buf);
-                    assetCount++;
-                    totalBytes += buf.length;
-                    const rel = path.relative(outputDir, mapped.diskPath);
-                    if (assetCount <= 15 || assetCount % 20 === 0) {
-                      console.log(`  ✓ [In-Flight Stream] ${info.mimeType} -> ${rel} (${buf.length.toLocaleString()} B)`);
-                    }
-                  }
-                }
-              } catch {
-                // Ignore transient or purged response bodies gracefully
-              }
-            })();
-            downloadQueue.push(task);
+      if (data.id !== undefined && pendingRequests.has(data.id)) {
+        const { resolve, reject, timer } = pendingRequests.get(data.id);
+        pendingRequests.delete(data.id);
+        clearTimeout(timer);
+        if (data.error) {
+          reject(new Error(data.error.message || 'CDP Error'));
+        } else {
+          resolve(data.result);
+        }
+        return;
+      }
+
+      if (!activeSessionId || data.sessionId !== activeSessionId) return;
+
+      if (data.method === 'Network.responseReceived') {
+        const { requestId, response } = data.params;
+        if (response && (response.status === 200 || response.status === 206)) {
+          const assetUrl = response.url;
+          if (assetUrl && !assetUrl.startsWith('data:') && !assetUrl.startsWith('blob:')) {
+            pendingResponses.set(requestId, {
+              url: assetUrl,
+              mimeType: response.mimeType || 'application/octet-stream',
+              status: response.status
+            });
           }
         }
-      } catch {}
+      } else if (data.method === 'Network.loadingFailed') {
+        const { requestId } = data.params;
+        pendingResponses.delete(requestId);
+      } else if (data.method === 'Network.loadingFinished') {
+        const { requestId } = data.params;
+        const info = pendingResponses.get(requestId);
+        if (info) {
+          pendingResponses.delete(requestId);
+          totalQueued++;
+          taskQueue.push(async () => {
+            try {
+              const bodyRes = await sendSession('Network.getResponseBody', { requestId });
+              if (bodyRes && typeof bodyRes.body === 'string') {
+                const mapped = mapUrlToFilePath(info.url, targetUrl, outputDir, info.mimeType);
+                if (mapped && mapped.diskPath) {
+                  const buf = bodyRes.base64Encoded
+                    ? Buffer.from(bodyRes.body, 'base64')
+                    : Buffer.from(bodyRes.body, 'utf-8');
+                  fs.mkdirSync(path.dirname(mapped.diskPath), { recursive: true });
+                  fs.writeFileSync(mapped.diskPath, buf);
+                  assetCount++;
+                  totalBytes += buf.length;
+                  const rel = path.relative(outputDir, mapped.diskPath);
+                  if (assetCount <= 15 || assetCount % 20 === 0) {
+                    console.log(`  ✓ [In-Flight Stream] ${info.mimeType} -> ${rel} (${buf.length.toLocaleString()} B)`);
+                  }
+                }
+              }
+            } catch {
+              // Ignore transient or purged response bodies gracefully
+            }
+          });
+          pumpQueue();
+        }
+      }
     });
+
+    ws.addEventListener('close', () => {
+      for (const [id, entry] of pendingRequests.entries()) {
+        clearTimeout(entry.timer);
+        entry.reject(new Error('CDP WebSocket connection closed'));
+        pendingRequests.delete(id);
+      }
+    });
+
+    const { targetId } = await send('Target.createTarget', { url: 'about:blank' });
+    const attachRes = await send('Target.attachToTarget', { targetId, flatten: true });
+    activeSessionId = attachRes.sessionId;
 
     // Enable domains
     await sendSession('Page.enable');
@@ -180,12 +245,20 @@ export async function captureRuntime(targetUrl, outputDir, options = {}) {
           new Promise((resolve) => {
             let totalHeight = 0;
             const distance = 450;
+            const fallback = setTimeout(() => { clearInterval(timer); resolve(); }, 15000);
             const timer = setInterval(() => {
-              window.scrollBy(0, distance);
-              totalHeight += distance;
-              if (totalHeight >= Math.min(document.body.scrollHeight, 18000)) {
+              try {
+                window.scrollBy(0, distance);
+                totalHeight += distance;
+                if (!document.body || totalHeight >= Math.min(document.body.scrollHeight, 18000)) {
+                  clearInterval(timer);
+                  clearTimeout(fallback);
+                  window.scrollTo(0, 0);
+                  resolve();
+                }
+              } catch {
                 clearInterval(timer);
-                window.scrollTo(0, 0);
+                clearTimeout(fallback);
                 resolve();
               }
             }, 120);
@@ -196,11 +269,11 @@ export async function captureRuntime(targetUrl, outputDir, options = {}) {
       await new Promise(r => setTimeout(r, 1500));
     }
 
-    // Await all queued in-flight downloads with a timeout
-    console.log(`▶ Finalizing in-flight stream downloads (${downloadQueue.length} assets queued)...`);
-    await Promise.allSettled(downloadQueue);
+    // Await bounded queue drain
+    console.log(`▶ Finalizing in-flight stream downloads (${totalQueued} assets queued)...`);
+    await waitForQueueDrain(15000);
 
-    // Extract hydrated HTML
+    // Extract hydrated HTML and preserve DOCTYPE to avoid Quirks Mode
     console.log(`▶ Extracting hydrated DOM...`);
     const domResult = await sendSession('Runtime.evaluate', {
       expression: 'document.documentElement.outerHTML',
@@ -208,9 +281,13 @@ export async function captureRuntime(targetUrl, outputDir, options = {}) {
     });
 
     if (domResult && domResult.result && domResult.result.value) {
+      let html = domResult.result.value;
+      if (!html.trim().toLowerCase().startsWith('<!doctype')) {
+        html = '<!DOCTYPE html>\n' + html;
+      }
       const htmlPath = path.join(outputDir, 'index.html');
-      fs.writeFileSync(htmlPath, domResult.result.value, 'utf-8');
-      domBytes = domResult.result.value.length;
+      fs.writeFileSync(htmlPath, html, 'utf-8');
+      domBytes = Buffer.byteLength(html, 'utf-8');
       console.log(`  ✓ Saved hydrated DOM to index.html (${domBytes.toLocaleString()} bytes)`);
     }
 
@@ -242,12 +319,34 @@ export async function captureRuntime(targetUrl, outputDir, options = {}) {
       assetCount,
       totalBytes
     };
+  };
+
+  try {
+    const capturePromise = runCapture();
+    capturePromise.catch(() => {});
+
+    const timeoutPromise = new Promise((_, reject) => {
+      overallTimer = setTimeout(() => {
+        aborted = true;
+        reject(new Error(`CDP Capture timed out after ${timeoutMs}ms for ${targetUrl}`));
+      }, timeoutMs);
+    });
+
+    return await Promise.race([capturePromise, timeoutPromise]);
   } catch (err) {
     console.error(`❌ CDP Capture Error: ${err.message}`);
     throw err;
   } finally {
-    if (ws) ws.close();
-    chrome.kill();
+    aborted = true;
+    clearTimeout(overallTimer);
+    for (const [id, entry] of pendingRequests.entries()) {
+      clearTimeout(entry.timer);
+      pendingRequests.delete(id);
+    }
+    if (ws) {
+      try { ws.close(); } catch {}
+    }
+    try { chrome.kill(); } catch {}
   }
 }
 
