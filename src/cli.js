@@ -8,6 +8,7 @@ import { spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { runReaAppAnalysis } from './engine/rea_bridge.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -26,6 +27,7 @@ Usage:
 Commands:
   clone <url> [name] [--port 3000]     Run parallel static & font extraction clone
   capture <url> [name] [--port 3000]   Run in-flight CDP stream capture & scaffolding
+  analyze <name> [--full-evidence]     Run REA static JS application graph analysis
   serve [name] [--port 3000]           Start hybrid fallback server for cloned site
   verify [name] [--port 3000]          Audit console errors, layout & capture screenshots
   list                                 Show all cloned projects in workspace
@@ -33,12 +35,15 @@ Commands:
 
 Options:
   --port <num>                         Local server port (default: 3000)
+  --rea                                Run REA live bundle & endpoint analysis during capture
+  --fetch-source-maps                  Fetch source maps when running capture with --rea
   --quiet                              Suppress verbose progress output
   --json                               Emit compact JSON output only
 
 Examples:
   node src/cli.js clone https://linear.app linear-clone --port 3001
-  node src/cli.js capture https://linear.app linear-runtime --port 3003 --json
+  node src/cli.js capture https://linear.app linear-runtime --port 3003 --rea --json
+  node src/cli.js analyze linear-runtime --json
   node src/cli.js serve linear-clone
   node src/cli.js verify linear-clone --json
 `);
@@ -111,7 +116,8 @@ async function main() {
           name: d.name,
           path: projPath,
           description,
-          hasManifest: fs.existsSync(path.join(projPath, 'clone-manifest.json'))
+          hasManifest: fs.existsSync(path.join(projPath, 'clone-manifest.json')),
+          hasRea: fs.existsSync(path.join(projPath, 'rea-analysis.json')) || fs.existsSync(path.join(projPath, 'rea-bundle.json'))
         };
       });
 
@@ -170,11 +176,41 @@ async function main() {
       if (options.json) cdpArgs.push('--json');
       if (options['no-scroll']) cdpArgs.push('--no-scroll');
       if (options.timeout) cdpArgs.push('--timeout', String(options.timeout));
+      if (options.rea) cdpArgs.push('--rea');
+      if (options['fetch-source-maps']) cdpArgs.push('--fetch-source-maps');
 
       const proc = spawn('node', cdpArgs, { stdio: 'inherit' });
       proc.on('close', (code) => {
         if (code !== 0) process.exit(code);
       });
+      break;
+    }
+
+    case 'analyze': {
+      const name = positional[0];
+      if (!name) {
+        console.error('❌ Error: Missing clone name or path. Usage: node src/cli.js analyze <name> [--json]');
+        process.exit(1);
+      }
+      const targetDir = resolveProjectDir(name);
+      if (!fs.existsSync(targetDir)) {
+        console.error(`❌ Error: Clone directory not found: ${targetDir}`);
+        process.exit(1);
+      }
+      if (!options.quiet && !options.json) {
+        console.log(`🔬 Running REA JavaScript Application Analysis on ${targetDir}...`);
+      }
+      const summary = await runReaAppAnalysis(targetDir, {
+        fullEvidence: Boolean(options['full-evidence']),
+        sourcePaths: options['source-path'] ? String(options['source-path']).split(',') : undefined
+      });
+      if (options.json) {
+        console.log(JSON.stringify(summary));
+      } else if (!options.quiet) {
+        console.log(`✓ Saved REA summary to ${path.join(targetDir, 'rea-analysis.json')}`);
+        console.log(`  Evidence ID: ${summary.evidenceId}`);
+        console.log(`  Graph Nodes: ${summary.nodeCount} | Edges: ${summary.edgeCount} | Analyzed Modules: ${summary.analyzedModuleCount}`);
+      }
       break;
     }
 

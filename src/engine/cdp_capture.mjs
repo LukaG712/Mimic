@@ -10,6 +10,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { isBlockedTrackerUrl, mapUrlToFilePath, rewriteExternalAssetUrls } from './url_mapper.mjs';
+import { runReaWebBundle } from './rea_bridge.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -479,6 +480,31 @@ export async function captureRuntime(targetUrl, outputDir, options = {}) {
     screenshotBytes = shotBuf.length;
     log(`  ✓ Saved screenshot to screenshot.png (${screenshotBytes.toLocaleString()} bytes)`);
 
+    // Optional REA live bundle analysis before closing Chrome
+    let reaSummary = null;
+    if (options.rea && !aborted) {
+      try {
+        await send('Target.detachFromTarget', { sessionId: activeSessionId });
+      } catch {}
+      try {
+        if (ws) {
+          ws.close();
+          ws = null;
+        }
+      } catch {}
+
+      log(`▶ Running REA static bundle & endpoint analysis...`);
+      try {
+        reaSummary = await runReaWebBundle(`http://127.0.0.1:${port}`, targetId, outputDir, {
+          fetchSourceMaps: Boolean(options.fetchSourceMaps),
+          timeoutMs: 30000
+        });
+        log(`  ✓ REA analyzed ${reaSummary.scriptsAnalyzed} script(s): ${reaSummary.routes.length} routes, ${reaSummary.endpoints.length} endpoints`);
+      } catch (reaErr) {
+        log(`  ⚠️ REA bundle analysis skipped: ${reaErr.message}`);
+      }
+    }
+
     // Scaffold standalone clone server and manifests
     scaffoldCloneManifests(targetUrl, outputDir, targetPort);
 
@@ -493,7 +519,8 @@ export async function captureRuntime(targetUrl, outputDir, options = {}) {
       totalBytes,
       externalHosts: [...capturedExternalHosts],
       mimeBreakdown,
-      page: extracted.page || {}
+      page: extracted.page || {},
+      ...(reaSummary ? { rea: reaSummary } : {})
     };
     await fs.promises.writeFile(
       path.join(outputDir, 'clone-manifest.json'),
@@ -513,7 +540,8 @@ export async function captureRuntime(targetUrl, outputDir, options = {}) {
       assetCount,
       skippedTrackers,
       totalBytes,
-      externalHosts: [...capturedExternalHosts]
+      externalHosts: [...capturedExternalHosts],
+      ...(reaSummary ? { rea: reaSummary } : {})
     };
   };
 
@@ -640,7 +668,7 @@ if (process.argv[1] && process.argv[1].endsWith('cdp_capture.mjs')) {
   const outArg = positional[1] || './clones/captured-site';
   const portArg = parseInt(flags.port || positional[2] || '3000', 10);
   if (!urlArg) {
-    console.log('Usage: node cdp_capture.mjs <url> [outputDir] [port] [--quiet] [--json] [--no-scroll] [--timeout 60000]');
+    console.log('Usage: node cdp_capture.mjs <url> [outputDir] [port] [--quiet] [--json] [--no-scroll] [--timeout 60000] [--rea] [--fetch-source-maps]');
     process.exit(1);
   }
 
@@ -649,7 +677,9 @@ if (process.argv[1] && process.argv[1].endsWith('cdp_capture.mjs')) {
     quiet: Boolean(flags.quiet),
     json: Boolean(flags.json),
     scroll: flags['no-scroll'] ? false : true,
-    timeout: flags.timeout ? parseInt(flags.timeout, 10) : undefined
+    timeout: flags.timeout ? parseInt(flags.timeout, 10) : undefined,
+    rea: Boolean(flags.rea),
+    fetchSourceMaps: Boolean(flags['fetch-source-maps'])
   })
     .then((res) => {
       if (flags.json) console.log(JSON.stringify(res));

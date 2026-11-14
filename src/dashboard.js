@@ -9,6 +9,7 @@ import path from 'path';
 import url from 'url';
 import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
+import { runReaAppAnalysis } from './engine/rea_bridge.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -52,6 +53,7 @@ function getAllClones() {
             }
             const hasScreenshot = fs.existsSync(path.join(projectPath, 'screenshot.png'));
             const hasManifest = fs.existsSync(path.join(projectPath, 'clone-manifest.json'));
+            const hasRea = fs.existsSync(path.join(projectPath, 'rea-analysis.json')) || fs.existsSync(path.join(projectPath, 'rea-bundle.json'));
 
             list.push({
               name: e.name,
@@ -61,6 +63,7 @@ function getAllClones() {
               port,
               hasScreenshot,
               hasManifest,
+              hasRea,
               running: activeServers.has(e.name)
             });
           }
@@ -99,7 +102,7 @@ const server = http.createServer(async (req, res) => {
 
   if (parsed.pathname === '/api/clone' && req.method === 'POST') {
     try {
-      const { targetUrl, name, port, engine = 'cdp' } = await readJsonBody(req);
+      const { targetUrl, name, port, engine = 'cdp', rea = false } = await readJsonBody(req);
       if (!targetUrl) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Missing targetUrl' }));
@@ -120,7 +123,9 @@ const server = http.createServer(async (req, res) => {
         });
       } else {
         const cdpScript = path.join(__dirname, 'engine', 'cdp_capture.mjs');
-        child = spawn('node', [cdpScript, targetUrl, targetDir, String(assignedPort)], {
+        const cdpArgs = [cdpScript, targetUrl, targetDir, String(assignedPort)];
+        if (rea) cdpArgs.push('--rea');
+        child = spawn('node', cdpArgs, {
           stdio: 'inherit'
         });
       }
@@ -194,6 +199,26 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (parsed.pathname === '/api/analyze' && req.method === 'POST') {
+    try {
+      const { name } = await readJsonBody(req);
+      const clones = getAllClones();
+      const match = clones.find(c => c.name === name);
+      if (!match) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: `Clone "${name}" not found` }));
+        return;
+      }
+      const summary = await runReaAppAnalysis(match.path);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, name: match.name, summary }));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
   if (parsed.pathname.startsWith('/screenshot/')) {
     const projName = decodeURIComponent(parsed.pathname.replace('/screenshot/', ''));
     const clones = getAllClones();
@@ -255,42 +280,48 @@ const server = http.createServer(async (req, res) => {
           Ingest any production URL via real-time CDP stream interception or parallel static crawling with automated multi-CDN proxy scaffolding.
         </p>
 
-        <form id="cloneForm" class="mt-8 grid grid-cols-1 sm:grid-cols-12 gap-3" onsubmit="triggerClone(event)">
-          <div class="sm:col-span-5">
-            <input 
-              id="urlInput"
-              type="url" 
-              required 
-              placeholder="https://example.com" 
-              class="w-full px-4 py-3 rounded-xl bg-black/60 border border-white/10 text-white placeholder-stone-500 text-sm focus:outline-none focus:border-amber-400"
-            />
+        <form id="cloneForm" class="mt-8" onsubmit="triggerClone(event)">
+          <div class="grid grid-cols-1 sm:grid-cols-12 gap-3">
+            <div class="sm:col-span-5">
+              <input 
+                id="urlInput"
+                type="url" 
+                required 
+                placeholder="https://example.com" 
+                class="w-full px-4 py-3 rounded-xl bg-black/60 border border-white/10 text-white placeholder-stone-500 text-sm focus:outline-none focus:border-amber-400"
+              />
+            </div>
+            <div class="sm:col-span-2">
+              <input 
+                id="nameInput"
+                type="text" 
+                placeholder="slug (optional)" 
+                class="w-full px-4 py-3 rounded-xl bg-black/60 border border-white/10 text-white placeholder-stone-500 text-sm focus:outline-none focus:border-amber-400"
+              />
+            </div>
+            <div class="sm:col-span-2">
+              <select
+                id="engineSelect"
+                class="w-full px-3 py-3 rounded-xl bg-black/60 border border-white/10 text-white text-sm focus:outline-none focus:border-amber-400"
+              >
+                <option value="cdp">In-Flight CDP</option>
+                <option value="static">Static Python</option>
+              </select>
+            </div>
+            <div class="sm:col-span-3">
+              <button 
+                type="submit" 
+                id="submitBtn"
+                class="w-full py-3 px-6 rounded-xl bg-white text-stone-900 font-semibold text-sm hover:bg-stone-200 active:scale-[0.98] transition shadow-md"
+              >
+                Clone Experience
+              </button>
+            </div>
           </div>
-          <div class="sm:col-span-2">
-            <input 
-              id="nameInput"
-              type="text" 
-              placeholder="slug (optional)" 
-              class="w-full px-4 py-3 rounded-xl bg-black/60 border border-white/10 text-white placeholder-stone-500 text-sm focus:outline-none focus:border-amber-400"
-            />
-          </div>
-          <div class="sm:col-span-2">
-            <select
-              id="engineSelect"
-              class="w-full px-3 py-3 rounded-xl bg-black/60 border border-white/10 text-white text-sm focus:outline-none focus:border-amber-400"
-            >
-              <option value="cdp">In-Flight CDP</option>
-              <option value="static">Static Python</option>
-            </select>
-          </div>
-          <div class="sm:col-span-3">
-            <button 
-              type="submit" 
-              id="submitBtn"
-              class="w-full py-3 px-6 rounded-xl bg-white text-stone-900 font-semibold text-sm hover:bg-stone-200 active:scale-[0.98] transition shadow-md"
-            >
-              Clone Experience
-            </button>
-          </div>
+          <label class="inline-flex items-center gap-2 mt-4 text-xs text-stone-300 cursor-pointer select-none">
+            <input id="reaCheck" type="checkbox" checked class="rounded bg-black/60 border-white/20 text-amber-400 focus:ring-0" />
+            <span>Run REA live bundle &amp; endpoint analysis (CDP mode)</span>
+          </label>
         </form>
 
         <div id="statusNotice" class="hidden mt-4 p-3 rounded-xl bg-amber-400/10 border border-amber-400/30 text-amber-300 text-xs font-mono"></div>
@@ -331,6 +362,7 @@ const server = http.createServer(async (req, res) => {
                 <div class="flex items-center justify-between text-xs text-stone-400 mb-2">
                   <div class="flex items-center gap-1.5">
                     <span class="px-2 py-0.5 rounded bg-white/5 border border-white/10 font-mono text-[10px]">\${c.source}</span>
+                    \${c.hasRea ? '<span class="px-2 py-0.5 rounded bg-amber-500/15 border border-amber-500/30 text-amber-300 font-mono text-[10px]">REA</span>' : ''}
                     \${c.running ? '<span class="px-2 py-0.5 rounded bg-emerald-500/15 border border-emerald-500/30 text-emerald-400 font-mono text-[10px]">LIVE</span>' : ''}
                   </div>
                   <span class="font-mono text-amber-400">Port :\${c.port}</span>
@@ -341,12 +373,20 @@ const server = http.createServer(async (req, res) => {
             </div>
 
             <div class="px-5 py-3 border-t border-white/5 flex items-center justify-between gap-2 text-xs">
-              <button
-                onclick="toggleServer('\${c.name}', \${c.running})"
-                class="px-3 py-1.5 rounded-lg border font-medium transition text-xs \${c.running ? 'border-rose-500/30 bg-rose-500/10 text-rose-300 hover:bg-rose-500/20' : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20'}"
-              >
-                \${c.running ? 'Stop Server' : 'Start Server'}
-              </button>
+              <div class="flex items-center gap-1.5">
+                <button
+                  onclick="toggleServer('\${c.name}', \${c.running})"
+                  class="px-2.5 py-1.5 rounded-lg border font-medium transition text-xs \${c.running ? 'border-rose-500/30 bg-rose-500/10 text-rose-300 hover:bg-rose-500/20' : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20'}"
+                >
+                  \${c.running ? 'Stop' : 'Start'}
+                </button>
+                <button
+                  onclick="analyzeClone('\${c.name}', this)"
+                  class="px-2.5 py-1.5 rounded-lg border border-amber-400/30 bg-amber-400/10 text-amber-300 hover:bg-amber-400/20 font-medium transition text-xs"
+                >
+                  Analyze (REA)
+                </button>
+              </div>
               <a href="http://localhost:\${c.port}" target="_blank" class="px-3 py-1.5 rounded-lg bg-white/10 hover:bg-white text-white hover:text-stone-950 font-medium transition text-xs">
                 Launch →
               </a>
@@ -355,6 +395,31 @@ const server = http.createServer(async (req, res) => {
         \`).join('');
       } catch (err) {
         console.error(err);
+      }
+    }
+
+    async function analyzeClone(name, btn) {
+      const notice = document.getElementById('statusNotice');
+      const prev = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = 'Analyzing...';
+      notice.classList.remove('hidden');
+      notice.textContent = 'Running REA static JS application analysis for ' + name + '...';
+      try {
+        const res = await fetch('/api/analyze', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name })
+        });
+        const d = await res.json();
+        if (!res.ok || d.error) throw new Error(d.error || 'Analysis failed');
+        notice.textContent = 'REA analyzed ' + d.summary.analyzedModuleCount + ' module(s) (' + d.summary.nodeCount + ' nodes, ' + d.summary.edgeCount + ' edges) -> saved rea-analysis.json';
+        await loadClones();
+      } catch (err) {
+        notice.textContent = 'REA Error: ' + err.message;
+      } finally {
+        btn.disabled = false;
+        btn.textContent = prev;
       }
     }
 
@@ -376,6 +441,7 @@ const server = http.createServer(async (req, res) => {
       const url = document.getElementById('urlInput').value;
       const name = document.getElementById('nameInput').value;
       const engine = document.getElementById('engineSelect').value;
+      const rea = document.getElementById('reaCheck').checked;
       const btn = document.getElementById('submitBtn');
       const notice = document.getElementById('statusNotice');
 
@@ -388,7 +454,7 @@ const server = http.createServer(async (req, res) => {
         const res = await fetch('/api/clone', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ targetUrl: url, name: name, engine: engine })
+          body: JSON.stringify({ targetUrl: url, name: name, engine: engine, rea: rea })
         });
         const d = await res.json();
         notice.textContent = 'Clone pipeline initialized for ' + d.slug + ' on port ' + d.port + ' (' + d.engine + ')! Refreshing...';

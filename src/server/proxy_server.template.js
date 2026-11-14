@@ -21,6 +21,23 @@ const ROOT = __dirname;
 const RESOLVED_ROOT = path.resolve(ROOT);
 const UPSTREAM = '{{UPSTREAM}}';
 
+const DISCOVERED_ENDPOINTS = new Set();
+try {
+  for (const manifestFile of ['clone-manifest.json', 'rea-bundle.json']) {
+    const mPath = path.join(RESOLVED_ROOT, manifestFile);
+    if (fs.existsSync(mPath)) {
+      const data = JSON.parse(fs.readFileSync(mPath, 'utf8'));
+      const reaData = data.rea || data;
+      const eps = Array.isArray(reaData.endpoints) ? reaData.endpoints : [];
+      for (const ep of eps) {
+        if (typeof ep === 'string' && ep.startsWith('/')) {
+          DISCOVERED_ENDPOINTS.add(ep.split('?')[0]);
+        }
+      }
+    }
+  }
+} catch {}
+
 const MIME_TYPES = {
   '.html': 'text/html; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
@@ -173,11 +190,18 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // API Mock Layer
-  if (pathname.startsWith('/api/') || pathname.startsWith('/_next/data/')) {
-    if (req.method === 'POST') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, status: 'success', timestamp: Date.now() }));
+  // API Mock Layer (handles POST/PUT/DELETE mutations and REA-discovered API routes without local files)
+  const isDiscoveredEndpoint = DISCOVERED_ENDPOINTS.has(pathname);
+  if (pathname.startsWith('/api/') || pathname.startsWith('/_next/data/') || isDiscoveredEndpoint) {
+    const candidateLocal = path.resolve(RESOLVED_ROOT, '.' + pathname);
+    if (!isPathInsideRoot(candidateLocal)) {
+      res.writeHead(403, { 'Content-Type': 'text/plain' });
+      res.end('403 Forbidden');
+      return;
+    }
+    if (req.method === 'POST' || req.method === 'PUT' || req.method === 'DELETE' || (isDiscoveredEndpoint && !fs.existsSync(candidateLocal))) {
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: true, status: 'success', mocked: true, endpoint: pathname, timestamp: Date.now() }));
       return;
     }
   }
