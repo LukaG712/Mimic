@@ -1,80 +1,103 @@
-# ⚡ Mimic — Production Website Reverse-Engineering & Cloning Suite
+# Mimic
 
-A comprehensive, automated toolkit for 1:1 website cloning, client-side runtime reverse engineering, asset harvesting, and autonomous fallback proxy serving.
+Mimic captures live websites into self-contained local directories that run offline or behind a local caching proxy. It includes two capture engines: a Chrome DevTools Protocol (CDP) engine for client-rendered applications and a multi-threaded Python crawler for static sites.
 
----
+## Requirements
 
-## 🏗️ Architecture & Core Components
+- Node.js 18+
+- Google Chrome or Chromium (used by `capture` and `verify` over CDP)
+- Python 3.8+ (used only by the `clone` static crawler)
 
-```
-C:\Users\gosse\Documents\Gemini\Webstack
-├── clones/                          # All cloned projects live here
-├── src/
-│   ├── cli.js                       # Master CLI orchestrator
-│   ├── dashboard.js                 # Visual browser studio (http://localhost:4000)
-│   ├── engine/
-│   │   ├── cloner.py                # Deep recursive static & font crawler
-│   │   ├── cdp_capture.mjs          # Chrome DevTools Protocol (CDP) runtime capture
-│   │   └── verifier.mjs             # Multi-viewport screenshot & health auditor
-│   └── server/
-│       └── proxy_server.template.js # Autonomous hybrid caching server template
-├── package.json
-└── README.md
-```
+## Usage
 
----
+Start the local web UI on `http://localhost:4000`:
 
-## 🚀 Quick Start
-
-### 1. Launch the Visual Dashboard
 ```bash
-cd C:\Users\gosse\Documents\Gemini\Webstack
 npm start
 ```
-Open **[http://localhost:4000](http://localhost:4000)** to view all existing clones across `Gemini\Clones` and `Webstack\clones`, or trigger a new clone with 1 click.
 
----
+Or run the CLI directly through `node src/cli.js` (or `npx mimic` when linked):
 
-### 2. Command Line Workflows
-
-#### A. Static Recursive Clone (Recommended for most sites)
-Ingests the root HTML, all linked stylesheets, scans CSS files recursively to download embedded webfonts (`.woff2`, `.woff`, `.ttf`) and background images, client JavaScript bundles, and scaffolds an autonomous proxy server.
 ```bash
-# Syntax: node src/cli.js clone <url> [name] [--port 3000]
-node src/cli.js clone https://linear.app linear-clone --port 3001
-```
+# Capture a rendered page and its network stream via headless Chrome (recommended for SPAs)
+node src/cli.js capture https://example.com example-app
 
-#### B. Runtime CDP Capture (For heavy SPAs, React, Next.js App Router)
-Launches headless Chrome via Chrome DevTools Protocol (CDP), navigates to the target, scrolls to trigger lazy loading, and captures the fully hydrated DOM and a desktop screenshot.
-```bash
-# Syntax: node src/cli.js capture <url> [name]
-node src/cli.js capture https://stripe.com stripe-runtime
-```
+# Crawl static HTML, stylesheets, fonts, and scripts via Python
+node src/cli.js clone https://example.com example-static --port 3001
 
-#### C. Run Any Cloned Site
-Starts the intelligent hybrid server for a cloned site.
-```bash
-# Syntax: node src/cli.js serve [name] [--port 3000]
-node src/cli.js serve linear-clone
-```
+# Serve a captured site locally (defaults to port 3000)
+node src/cli.js serve example-app --port 3000
 
-#### D. Visual & Console Health Audit
-Audits console errors, 404 network misses, and captures desktop (1440x900) + mobile (390x844) screenshots.
-```bash
-# Syntax: node src/cli.js verify [name] [--port 3000]
-node src/cli.js verify linear-clone
-```
+# Run a headless audit at desktop (1440x900) and mobile (390x844) viewports
+node src/cli.js verify example-app
 
-#### E. List All Projects
-```bash
+# List captured projects
 node src/cli.js list
 ```
 
----
+### CLI flags
 
-## 🛡️ Autonomous Fallback Proxy (`server.js`)
+| Flag | Applies to | Description |
+| :--- | :--- | :--- |
+| `--port <number>` | `clone`, `serve`, `verify` | Local port to write into `server.js` or bind when serving (default `3000`). |
+| `--no-scroll` | `capture` | Skip the full-page scroll pass before extracting the DOM. |
+| `--timeout <ms>` | `capture`, `verify` | Maximum run time in milliseconds before aborting (`60000` for `capture`, `45000` for `verify`). |
+| `--quiet`, `-q` | `capture`, `clone`, `verify` | Suppress progress logs. |
+| `--json` | `capture`, `clone`, `verify`, `list` | Print a single JSON summary line to stdout. |
 
-Every site cloned by Webstack includes a dedicated `server.js` configured with:
-1. **Static Local Serving:** High-performance local file delivery with accurate modern MIME types.
-2. **On-Demand Upstream Caching:** If the client requests any asset that wasn't captured during initial crawling (e.g. dynamic sub-chunks, localized fonts, lazy images), the server automatically fetches it from the original live site, streams it to the browser, and saves it to disk locally.
-3. **API Mock Layer:** Prevents client-side script crashes by answering common POST and API endpoints with mocked successful payloads.
+## How capture and serving work
+
+### CDP capture (`src/engine/cdp_capture.mjs`)
+
+`capture` launches headless Chrome with the Fetch and Network domains enabled and intercepts responses in flight before the browser discards or mutates them. Common analytics and telemetry hosts (`google-analytics.com`, `segment.io`, `sentry.io`, `intercom.io`, and similar) are dropped during capture so tracker noise does not land on disk.
+
+Once network activity settles, Mimic scrolls the page to trigger intersection observers, converts lazy images (`loading="lazy"`, `data-src`, `data-srcset`) to eager attributes, serializes `<canvas>` elements to inline PNG data URLs, and writes the hydrated DOM to `index.html`. External CDN URLs referenced in HTML and CSS are rewritten to `/external/<host>/...` so the local server can resolve them without CORS failures.
+
+Each capture writes a compact `clone-manifest.json` containing asset counts, total bytes, skipped tracker count, and structural tags (`title`, `h1`, stylesheet and script paths) so automated tooling can inspect a clone without reading raw HTML bundles.
+
+### Static crawler (`src/engine/cloner.py`)
+
+`clone` fetches the root document, parses linked stylesheets, scripts, and media, and recursively scans CSS files for `@font-face` and `url(...)` references. Assets are downloaded concurrently through a 12-worker thread pool.
+
+### Local proxy server (`src/server/proxy_server.template.js`)
+
+Every captured project gets a zero-dependency `server.js`. When a browser requests a file:
+
+1. The server checks the local clone directory first, matching URL query strings against MD5 query-hash suffixes (`_<hash>`) generated by `url_mapper.mjs`.
+2. If an asset has no file extension or uses `.bin`, the server inspects the first bytes of the buffer to detect PNG, JPEG, GIF, WebP, WOFF/WOFF2, PDF, gzip, or text payloads and sets `Content-Type` accordingly.
+3. If the file is missing locally, the server fetches it from the origin (or from the target CDN for `/external/<host>/...` paths), streams the response to the browser, and caches the file on disk for subsequent requests.
+4. `POST`, `PUT`, `DELETE`, and `/api/*` requests that have no local fixture return `200 OK` with `{"status":"ok","mocked":true}` so client bundles do not crash on unauthenticated mutations.
+
+All resolved paths are checked against the clone root directory to block path traversal (`/../` or URL-encoded `%2e%2e`).
+
+### Verification (`src/engine/verifier.mjs`)
+
+`verify` boots the clone's `server.js` on an ephemeral port, loads it in headless Chrome at `1440x900` and `390x844`, checks for broken `<img>` elements and unintended horizontal overflow, deduplicates console and network errors, saves `audit-desktop.png` and `audit-mobile.png`, and writes `audit-report.json`.
+
+## Repository layout
+
+```text
+├── clones/                          # Captured sites (gitignored except .gitkeep)
+├── src/
+│   ├── cli.js                       # CLI entry point
+│   ├── dashboard.js                 # Local web UI (port 4000)
+│   ├── engine/
+│   │   ├── cdp_capture.mjs          # Headless Chrome in-flight stream capture
+│   │   ├── cloner.py                # Concurrent static HTML/CSS/font crawler
+│   │   ├── url_mapper.mjs           # URL-to-disk path mapping, tracker filter, CDN rewriter
+│   │   └── verifier.mjs             # Headless viewport & console auditor
+│   └── server/
+│       └── proxy_server.template.js # Per-clone local server & upstream cache template
+└── test/
+    ├── cdp_stream.test.mjs          # End-to-end CDP capture & timeout test
+    ├── turnkey_scaffold.test.mjs    # Scaffold, MIME sniffing, & path-traversal test
+    └── url_mapper.test.mjs          # URL mapping, tracker filter, & CDN rewrite unit tests
+```
+
+## Tests
+
+Run the unit and integration test suite:
+
+```bash
+npm test
+```
