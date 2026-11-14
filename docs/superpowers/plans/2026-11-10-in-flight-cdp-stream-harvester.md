@@ -8,8 +8,6 @@
 
 **Tech Stack:** Node.js 24 (ES Modules, native `WebSocket`, `fetch`, `Buffer`), Chrome DevTools Protocol (CDP), Headless Chrome.
 
-**Spec:** [`docs/superpowers/specs/2026-11-10-ten-pillars-cloning-pipeline-design.md`](file:///c:/Users/gosse/Documents/Gemini/Webstack/docs/superpowers/specs/2026-11-10-ten-pillars-cloning-pipeline-design.md)
-
 ## Global Constraints
 
 - **Platform:** Windows 11 with Node.js 24 (`"type": "module"` in `package.json`).
