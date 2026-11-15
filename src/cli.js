@@ -10,16 +10,19 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { runReaAppAnalysis } from './engine/rea_bridge.mjs';
 import { unpackDesktopApp } from './engine/desktop_unpacker.mjs';
+import { analyzeSoftware } from './reverse/orchestrator/analysis_pipeline.mjs';
+import { discoverTools } from './reverse/orchestrator/tool_registry.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const ROOT = path.resolve(__dirname, '..');
 const CLONES_DIR = path.resolve(ROOT, 'clones');
+const ANALYSES_DIR = path.resolve(ROOT, 'analyses');
 
 function showHelp() {
   console.log(`
 ┌─────────────────────────────────────────────────────────────┐
-│  ⚡ MIMIC — High-Fidelity Website Reverse-Engineering Suite  │
+│  ⚡ MIMIC — High-Fidelity Software Reverse-Engineering Suite │
 └─────────────────────────────────────────────────────────────┘
 
 Usage:
@@ -29,6 +32,8 @@ Commands:
   clone <url> [name] [--port 3000]     Run parallel static & font extraction clone
   capture <url> [name] [--port 3000]   Run in-flight CDP stream capture & scaffolding
   unpack <asar|dir> [name]             Unpack an Electron .asar or app folder into a clone
+  inspect-bin <file.exe|file.msi> [name]  Analyze, unpack & decompile Windows .exe/.msi binaries
+  tools                                List available external reverse-engineering tools
   analyze <name> [--full-evidence]     Run REA static JS application graph analysis
   serve [name] [--port 3000]           Start hybrid fallback server for cloned site
   verify [name] [--port 3000]          Audit console errors, layout & capture screenshots
@@ -404,6 +409,65 @@ app.on('window-all-closed', () => {
         console.log(JSON.stringify({ ok: true, removed: targetDir }));
       } else if (!options.quiet) {
         console.log(`✓ Removed clone: ${targetDir}`);
+      }
+      break;
+    }
+
+    case 'tools': {
+      const tools = discoverTools();
+      if (options.json) {
+        console.log(JSON.stringify({ ok: true, tools }, null, 2));
+      } else {
+        console.log('\n🔧 Mimic External Reverse-Engineering Tools:\n');
+        for (const t of Object.values(tools)) {
+          const icon = t.available ? '✓' : '✗';
+          const info = t.available ? `${t.version} (${t.path})` : 'not installed';
+          console.log(`  ${icon} ${t.id.padEnd(13)} ${t.name.padEnd(24)} ${info}`);
+        }
+        console.log('');
+      }
+      break;
+    }
+
+    case 'inspect-bin': {
+      const targetFile = positional[0];
+      if (!targetFile) {
+        console.error('❌ Error: Missing file path. Usage: node src/cli.js inspect-bin <file.exe|file.msi> [name]');
+        process.exit(1);
+      }
+      const absFile = path.resolve(targetFile);
+      if (!fs.existsSync(absFile)) {
+        console.error(`❌ Error: File not found: ${absFile}`);
+        process.exit(1);
+      }
+      const defaultSlug = path.basename(absFile).replace(/[^a-zA-Z0-9._-]/g, '-');
+      const slug = positional[1] || defaultSlug;
+      const outDir = path.join(ANALYSES_DIR, slug);
+
+      const { reportPath, report } = await analyzeSoftware(absFile, outDir, {
+        extract: options['no-extract'] ? false : true,
+        decompile: options['no-decompile'] ? false : true,
+        onProgress: (ev) => {
+          if (!options.quiet && !options.json) {
+            console.log(`  [${ev.phase}] ${ev.message}`);
+          }
+        }
+      });
+
+      if (options.json) {
+        console.log(JSON.stringify({ ok: true, outDir, reportPath, report }, null, 2));
+      } else if (!options.quiet) {
+        console.log(`\n✓ Software Analysis Complete (${report.overallStatus})`);
+        console.log(`  File:         ${report.file.name} (${report.file.size} bytes)`);
+        console.log(`  SHA-256:      ${report.file.sha256}`);
+        console.log(`  Type:         ${report.identity.fileType}`);
+        console.log(`  Architecture: ${report.identity.architecture || 'N/A'}`);
+        console.log(`  Runtime:      ${report.identity.runtime || 'N/A'}`);
+        if (report.identity.installerFramework) console.log(`  Installer:    ${report.identity.installerFramework}`);
+        if (report.identity.packers?.length) console.log(`  Packers:      ${report.identity.packers.join(', ')}`);
+        console.log(`  Extraction:   ${report.extraction.status} (${report.extraction.files.length} files)`);
+        console.log(`  Decompile:    ${report.decompilation.status} (${report.decompilation.files.length} files)`);
+        console.log(`  Report:       ${reportPath}\n`);
       }
       break;
     }

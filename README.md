@@ -43,9 +43,15 @@ node src/cli.js serve example-app --port 3000 --offline
 # Run a headless audit at desktop (1440x900) and mobile (390x844) viewports + visual diff
 node src/cli.js verify example-app
 
-# Export a clone as a .zip archive or generate a Dockerfile
+# Export a clone as a .zip archive or generate a Dockerfile or Electron wrapper
 node src/cli.js export example-app --format zip
 node src/cli.js export example-app --format docker
+node src/cli.js export example-app --format electron
+
+# Inspect, unpack, and decompile Windows .exe and .msi packages
+node src/cli.js inspect-bin /path/to/app.exe
+node src/cli.js inspect-bin /path/to/installer.msi --json
+node src/cli.js tools
 
 # List or remove captured projects
 node src/cli.js list
@@ -107,29 +113,39 @@ All resolved paths are checked against the clone root directory to block path tr
 
 `verify` boots the clone's `server.js` on an ephemeral port, loads it in headless Chrome at `1440x900` and `390x844`, checks for broken `<img>` elements, failed `document.fonts`, `<video>` errors, missing `<svg><use>` targets, and horizontal overflow, deduplicates console and network errors, compares `screenshot.png` against `baseline-desktop.png` (writing `diff-desktop.png`), and writes `audit-report.json`.
 
+## Windows Software Reverse-Engineering (`.exe` / `.msi`)
+
+Mimic includes a modular static analysis, safe extraction, and decompilation subsystem (`src/reverse/`) integrated into both the CLI (`inspect-bin`, `tools`) and the **Software Analysis** section of Mimic Studio.
+
+- **Format & Runtime Identification (`src/reverse/detection/file_identifier.mjs`):** Detects PE32/PE32+, .NET Framework, Modern / Single-File .NET, Electron, PyInstaller, Nuitka, AutoIt, UPX/ASPack/Themida/VMProtect packers, MSI OLE2 packages, and installers (Inno Setup, NSIS, WiX Burn, InstallShield, Advanced Installer, Squirrel, 7-Zip SFX, WinRAR SFX).
+- **Static PE & Strings Analysis (`pe_analyzer.mjs`, `strings_analyzer.mjs`):** Extracts sections with Shannon entropy, DLL imports/exports, CodeView PDB paths, CLR `.NET` headers, Authenticode presence, embedded XML manifests, URLs, IPv4 addresses, Windows paths, and registry keys.
+- **MSI Database & Extraction (`msi_analyzer.mjs`, `msi_extractor.mjs`):** Parses OLE2 Compound File containers, decodes 6-bit MSI table names, detects embedded `MSCF` CABs and external `.cab` references, and uses `msiinfo`/`msiextract`/`lessmsi`/`7z` (when installed) to inspect MSI tables and extract payloads without executing custom actions.
+- **Decompilation Adapters (`dotnet_decompiler.mjs`, `native_decompiler.mjs`, `python_decompiler.mjs`):**
+  - **.NET:** `ilspycmd` for C# source recovery.
+  - **Native PE:** Ghidra Headless (`analyzeHeadless`) for C pseudocode or GNU `objdump` for Intel disassembly.
+  - **PyInstaller:** Built-in CArchive extractor + `uncompyle6`/`decompyle3` or Python stdlib `marshal`/`dis` disassembly.
+- **Safety & Honesty:** Target binaries and MSI custom actions are never executed. All extractions enforce strict path-traversal validation (`isSafeSubpath`) and subprocess timeouts, and reports distinguish `decompiled`, `extracted`, `partial`, `unsupported`, and `failed`.
+
 ## Repository layout
 
 ```text
 ├── .github/workflows/ci.yml         # CI workflow running npm test
 ├── clones/                          # Captured sites (gitignored except .gitkeep)
+├── analyses/                        # Binary/MSI analysis outputs (gitignored)
 ├── src/
 │   ├── cli.js                       # CLI entry point
-│   ├── dashboard.js                 # Local web UI (port 4000) with SSE logs & inspector
-│   ├── engine/
-│   │   ├── cdp_capture.mjs          # Headless/headed Chrome in-flight stream capture
-│   │   ├── chrome_finder.mjs        # Cross-platform Chrome/Chromium discovery
-│   │   ├── cloner.py                # Concurrent static HTML/CSS/font crawler
-│   │   ├── png_diff.mjs             # Zero-dependency PNG pixel diffing
-│   │   ├── rea_bridge.mjs           # REA bundle and static JS application bridge
-│   │   ├── url_mapper.mjs           # URL-to-disk path mapping, tracker filter, CDN rewriter
-│   │   └── verifier.mjs             # Headless viewport, asset health & visual diff auditor
+│   ├── dashboard.js                 # Local web UI (port 4000) with SSE logs, Clone & Software Inspectors
+│   ├── engine/                      # Web capture, Chrome discovery, PNG diff, REA bridge, desktop unpacker
+│   ├── reverse/                     # Windows PE/MSI detection, extraction, decompilation & pipeline
 │   └── server/
 │       └── proxy_server.template.js # Per-clone local server, fixture replay & upstream cache
 └── test/
     ├── cdp_stream.test.mjs          # End-to-end CDP capture, crawl, fixture & timeout test
     ├── dashboard.test.mjs           # Studio API & client script compilation test
+    ├── desktop_unpacker.test.mjs    # Electron .asar unpacker tests
     ├── new_features.test.mjs        # Chrome finder, PNG diff, fixture replay & offline mode tests
     ├── rea_bridge.test.mjs          # REA output parser & JS application analysis test
+    ├── reverse_engineering.test.mjs # PE, .NET, PyInstaller, MSI, & path-traversal safety tests
     ├── turnkey_scaffold.test.mjs    # Scaffold, MIME sniffing, & path-traversal test
     └── url_mapper.test.mjs          # URL mapping, tracker filter, & CDN rewrite unit tests
 ```

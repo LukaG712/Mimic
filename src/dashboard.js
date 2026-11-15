@@ -11,15 +11,19 @@ import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 import { runReaAppAnalysis } from './engine/rea_bridge.mjs';
 import { verifyClone } from './engine/verifier.mjs';
+import { analyzeSoftware } from './reverse/orchestrator/analysis_pipeline.mjs';
+import { discoverTools, isSafeSubpath } from './reverse/orchestrator/tool_registry.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const ROOT = path.resolve(__dirname, '..');
 const CLONES_DIR = path.resolve(ROOT, 'clones');
+const ANALYSES_DIR = path.resolve(ROOT, 'analyses');
 const LEGACY_CLONES_DIR = 'C:\\Users\\gosse\\Documents\\Gemini\\Clones';
 
 const PORT = parseInt(process.env.DASHBOARD_PORT || '4000', 10);
 const activeServers = new Map();
+const softwareJobs = new Map();
 
 function readJsonSafe(filePath) {
   if (!fs.existsSync(filePath)) return null;
@@ -118,12 +122,22 @@ function getAllClones() {
   return list;
 }
 
-function readJsonBody(req) {
+function readJsonBody(req, maxBytes = 1024 * 1024) {
   return new Promise((resolve, reject) => {
-    let body = '';
-    req.on('data', chunk => { body += chunk; });
+    const chunks = [];
+    let total = 0;
+    req.on('data', chunk => {
+      total += chunk.length;
+      if (total > maxBytes) {
+        reject(new Error(`Request body exceeded ${maxBytes} bytes`));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
     req.on('end', () => {
       try {
+        const body = Buffer.concat(chunks).toString('utf8');
         resolve(body ? JSON.parse(body) : {});
       } catch (err) {
         reject(err);
@@ -131,6 +145,34 @@ function readJsonBody(req) {
     });
     req.on('error', reject);
   });
+}
+
+function getAllSoftwareAnalyses() {
+  if (!fs.existsSync(ANALYSES_DIR)) return [];
+  const items = [];
+  for (const entry of fs.readdirSync(ANALYSES_DIR, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const reportPath = path.join(ANALYSES_DIR, entry.name, 'analysis-report.json');
+    const report = readJsonSafe(reportPath);
+    if (!report) continue;
+    items.push({
+      slug: entry.name,
+      analyzedAt: report.analyzedAt,
+      fileName: report.file?.name || entry.name,
+      size: report.file?.size || 0,
+      sha256: report.file?.sha256 || '',
+      kind: report.identity?.kind || 'unknown',
+      fileType: report.identity?.fileType || 'Unknown',
+      architecture: report.identity?.architecture || null,
+      runtime: report.identity?.runtime || null,
+      installerFramework: report.identity?.installerFramework || null,
+      packers: report.identity?.packers || [],
+      overallStatus: report.overallStatus || 'partial',
+      extractedCount: report.extraction?.files?.length || 0,
+      decompiledCount: report.decompilation?.files?.length || 0
+    });
+  }
+  return items.sort((a, b) => (b.analyzedAt || '').localeCompare(a.analyzedAt || ''));
 }
 
 function sendJson(res, status, payload) {
@@ -177,6 +219,178 @@ const server = http.createServer(async (req, res) => {
 
   if (parsed.pathname === '/api/clones') {
     sendJson(res, 200, { clones: getAllClones() });
+    return;
+  }
+
+  // --- Software Reverse-Engineering (.EXE / .MSI) API Routes ---
+  if (parsed.pathname === '/api/software/tools' && req.method === 'GET') {
+    sendJson(res, 200, { tools: discoverTools() });
+    return;
+  }
+
+  if (parsed.pathname === '/api/software/list' && req.method === 'GET') {
+    sendJson(res, 200, { analyses: getAllSoftwareAnalyses() });
+    return;
+  }
+
+  if (parsed.pathname === '/api/software/inspect' && req.method === 'GET') {
+    const name = String(parsed.query.name || '').replace(/[^a-zA-Z0-9._-]/g, '');
+    const analysisDir = path.join(ANALYSES_DIR, name);
+    const reportPath = path.join(analysisDir, 'analysis-report.json');
+    if (!name || !isSafeSubpath(ANALYSES_DIR, analysisDir) || !fs.existsSync(reportPath)) {
+      sendJson(res, 404, { error: `Software analysis "${name}" not found` });
+      return;
+    }
+    sendJson(res, 200, { slug: name, report: readJsonSafe(reportPath) });
+    return;
+  }
+
+  if (parsed.pathname === '/api/software/file' && req.method === 'GET') {
+    const name = String(parsed.query.name || '').replace(/[^a-zA-Z0-9._-]/g, '');
+    const relPath = String(parsed.query.path || '');
+    const analysisDir = path.join(ANALYSES_DIR, name);
+    const targetPath = path.resolve(analysisDir, relPath);
+    if (!name || !relPath || !isSafeSubpath(analysisDir, targetPath) || !fs.existsSync(targetPath) || fs.statSync(targetPath).isDirectory()) {
+      sendJson(res, 404, { error: 'File not found or invalid path' });
+      return;
+    }
+    const stat = fs.statSync(targetPath);
+    const maxPreview = 256 * 1024;
+    const raw = fs.readFileSync(targetPath);
+    const truncated = raw.length > maxPreview;
+    const slice = truncated ? raw.subarray(0, maxPreview) : raw;
+    const isBinary = slice.includes(0);
+    sendJson(res, 200, {
+      path: relPath,
+      size: stat.size,
+      truncated,
+      isBinary,
+      content: isBinary ? `[Binary file: ${stat.size} bytes]` : slice.toString('utf8')
+    });
+    return;
+  }
+
+  if (parsed.pathname === '/api/software/export' && req.method === 'GET') {
+    const name = String(parsed.query.name || '').replace(/[^a-zA-Z0-9._-]/g, '');
+    const analysisDir = path.join(ANALYSES_DIR, name);
+    if (!name || !isSafeSubpath(ANALYSES_DIR, analysisDir) || !fs.existsSync(analysisDir)) {
+      sendJson(res, 404, { error: 'Analysis not found' });
+      return;
+    }
+    const zipBase = path.join(ANALYSES_DIR, `${name}-package`);
+    const zipPath = `${zipBase}.zip`;
+    const pyZip = spawn('python3', [
+      '-c',
+      'import shutil, sys; shutil.make_archive(sys.argv[1], "zip", sys.argv[2])',
+      zipBase,
+      analysisDir
+    ], { stdio: 'ignore' });
+    pyZip.on('close', (code) => {
+      if (code !== 0 || !fs.existsSync(zipPath)) {
+        sendJson(res, 500, { error: 'Failed to create ZIP archive' });
+        return;
+      }
+      res.writeHead(200, {
+        'Content-Type': 'application/zip',
+        'Content-Disposition': `attachment; filename="${name}-analysis.zip"`
+      });
+      fs.createReadStream(zipPath).pipe(res);
+    });
+    return;
+  }
+
+  if (parsed.pathname === '/api/software/stream' && req.method === 'GET') {
+    const jobId = String(parsed.query.jobId || '');
+    const job = softwareJobs.get(jobId);
+    if (!job) {
+      sendJson(res, 404, { error: 'Software analysis job not found' });
+      return;
+    }
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive'
+    });
+    for (const line of job.logs) {
+      res.write(`data: ${JSON.stringify({ type: 'log', line })}\n\n`);
+    }
+    if (job.done) {
+      res.write(`data: ${JSON.stringify({ type: 'done', code: job.code, slug: job.slug, error: job.error || null })}\n\n`);
+      res.end();
+      return;
+    }
+    job.clients.add(res);
+    req.on('close', () => job.clients.delete(res));
+    return;
+  }
+
+  if (parsed.pathname === '/api/software/analyze' && req.method === 'POST') {
+    try {
+      const body = await readJsonBody(req, 64 * 1024 * 1024);
+      const { fileName, base64Data, localPath, slug: customSlug, extract = true, decompile = true } = body;
+      const rawName = path.basename(String(fileName || localPath || 'binary.exe'));
+      const slug = (String(customSlug || rawName).toLowerCase().replace(/[^a-z0-9._-]/g, '-').replace(/^-+|-+$/g, '')) || `bin-${Date.now()}`;
+      const outDir = path.join(ANALYSES_DIR, slug);
+      fs.mkdirSync(outDir, { recursive: true });
+
+      let targetPath = null;
+      if (base64Data) {
+        const inputDir = path.join(outDir, 'input');
+        fs.mkdirSync(inputDir, { recursive: true });
+        const safeName = rawName.replace(/[^a-zA-Z0-9._-]/g, '_') || 'sample.bin';
+        targetPath = path.join(inputDir, safeName);
+        fs.writeFileSync(targetPath, Buffer.from(base64Data, 'base64'));
+      } else if (localPath && fs.existsSync(String(localPath))) {
+        targetPath = path.resolve(String(localPath));
+      } else {
+        sendJson(res, 400, { error: 'Provide either base64Data upload or a valid localPath' });
+        return;
+      }
+
+      const jobId = `sw-${slug}-${Date.now()}`;
+      const job = { id: jobId, slug, logs: [], clients: new Set(), done: false, code: null, error: null };
+      softwareJobs.set(jobId, job);
+
+      const pushLog = (line) => {
+        job.logs.push(line);
+        if (job.logs.length > 200) job.logs.shift();
+        for (const client of job.clients) {
+          client.write(`data: ${JSON.stringify({ type: 'log', line })}\n\n`);
+        }
+      };
+
+      analyzeSoftware(targetPath, outDir, {
+        extract: Boolean(extract),
+        decompile: Boolean(decompile),
+        onProgress: (ev) => pushLog(`[${ev.phase}] ${ev.message}`)
+      })
+        .then(() => {
+          job.done = true;
+          job.code = 0;
+          for (const client of job.clients) {
+            client.write(`data: ${JSON.stringify({ type: 'done', code: 0, slug })}\n\n`);
+            client.end();
+          }
+          job.clients.clear();
+          setTimeout(() => softwareJobs.delete(jobId), 5 * 60 * 1000);
+        })
+        .catch((err) => {
+          job.done = true;
+          job.code = 1;
+          job.error = err.message;
+          pushLog(`[error] ${err.message}`);
+          for (const client of job.clients) {
+            client.write(`data: ${JSON.stringify({ type: 'done', code: 1, slug, error: err.message })}\n\n`);
+            client.end();
+          }
+          job.clients.clear();
+          setTimeout(() => softwareJobs.delete(jobId), 5 * 60 * 1000);
+        });
+
+      sendJson(res, 200, { ok: true, jobId, slug, outDir });
+    } catch (err) {
+      sendJson(res, 400, { error: err.message });
+    }
     return;
   }
 
@@ -862,11 +1076,84 @@ function RENDER_DASHBOARD_HTML() {
       <!-- Clone Catalog Container -->
       <div id="catalogContainer"></div>
     </section>
+
+    <!-- Software Analysis (.EXE / .MSI) Reverse-Engineering Section -->
+    <section id="softwareAnalysisSection" class="surface rounded-2xl p-6 sm:p-8 space-y-6">
+      <div class="flex flex-col md:flex-row md:items-end justify-between gap-4">
+        <div>
+          <div class="flex items-center gap-2.5">
+            <h2 class="font-display text-2xl sm:text-3xl font-semibold tracking-tight">Software Analysis</h2>
+            <span class="font-mono text-[10px] px-2 py-0.5 rounded-full" style="background: var(--accent-soft); color: var(--accent); border: 1px solid var(--accent);">Static &amp; Isolated Only</span>
+          </div>
+          <p class="text-sm mt-1.5" style="color: var(--text-muted);">
+            Inspect, unpack, and decompile Windows <code class="font-mono">.exe</code> and <code class="font-mono">.msi</code> packages without executing them.
+          </p>
+        </div>
+        <div id="swToolsBar" class="flex flex-wrap items-center gap-1.5 text-[11px] font-mono"></div>
+      </div>
+
+      <div id="swDropZone" class="rounded-2xl p-6 text-center transition cursor-pointer" style="background: var(--bg); border: 1.5px dashed var(--border);" onclick="document.getElementById('swFileInput').click()" ondragover="event.preventDefault(); this.style.borderColor='var(--accent)';" ondragleave="this.style.borderColor='var(--border)';" ondrop="handleSwDrop(event)">
+        <input id="swFileInput" type="file" accept=".exe,.msi,.dll,.zip,.asar" class="hidden" onchange="handleSwFileSelect(event)" />
+        <div class="text-sm font-medium">Drop a Windows <code class="font-mono">.exe</code> or <code class="font-mono">.msi</code> file here, or click to browse</div>
+        <div id="swSelectedFileLabel" class="text-xs font-mono mt-1" style="color: var(--text-dim);">Supports PE32/PE32+, .NET, Electron, PyInstaller, Inno Setup, NSIS, WiX Burn, UPX, and MSI</div>
+      </div>
+
+      <div class="grid grid-cols-1 sm:grid-cols-12 gap-3 items-center">
+        <div class="sm:col-span-6">
+          <input id="swLocalPathInput" type="text" placeholder="Or enter a local server path e.g. /tmp/app.exe (optional)" class="w-full px-3.5 py-2.5 rounded-xl text-xs font-mono" />
+        </div>
+        <div class="sm:col-span-3 flex items-center gap-4 text-xs" style="color: var(--text-muted);">
+          <label class="inline-flex items-center gap-1.5 cursor-pointer select-none">
+            <input id="swExtractCheck" type="checkbox" checked />
+            <span>Extract</span>
+          </label>
+          <label class="inline-flex items-center gap-1.5 cursor-pointer select-none">
+            <input id="swDecompileCheck" type="checkbox" checked />
+            <span>Decompile</span>
+          </label>
+        </div>
+        <div class="sm:col-span-3">
+          <button id="swAnalyzeBtn" onclick="startSoftwareAnalysis()" class="spring-btn w-full py-2.5 px-4 rounded-xl text-sm font-semibold" style="background: var(--accent); color: var(--accent-fg);">
+            Analyze Binary
+          </button>
+        </div>
+      </div>
+
+      <div id="swLiveLogPanel" class="hidden rounded-xl p-3 font-mono text-[11px] max-h-40 overflow-y-auto space-y-0.5" style="background: var(--bg); border: 1px solid var(--border); color: var(--text-muted);"></div>
+
+      <div id="softwareListContainer" class="space-y-3"></div>
+    </section>
   </main>
 
   <footer class="px-6 py-5 text-center font-mono text-xs" style="border-top: 1px solid var(--border); color: var(--text-dim);">
     Mimic Studio • Local Reverse-Engineering Workbench
   </footer>
+
+  <!-- Software Analysis Side-Peek Drawer -->
+  <div id="swDrawerBackdrop" class="drawer-backdrop fixed inset-0 z-40 bg-black/50 backdrop-blur-sm" onclick="closeSwInspector()"></div>
+  <aside id="swInspectorDrawer" class="drawer-panel fixed top-0 right-0 bottom-0 w-full max-w-3xl z-50 flex flex-col shadow-2xl">
+    <div class="px-6 py-4 flex items-center justify-between" style="border-bottom: 1px solid var(--border);">
+      <div class="min-w-0">
+        <div class="flex items-center gap-2">
+          <h2 id="swDrawerTitle" class="font-display text-xl font-semibold truncate">Software Inspector</h2>
+          <span id="swDrawerStatusBadge" class="font-mono text-xs px-2 py-0.5 rounded"></span>
+        </div>
+        <div id="swDrawerSubtitle" class="font-mono text-xs truncate mt-0.5" style="color: var(--text-muted);"></div>
+      </div>
+      <div class="flex items-center gap-2">
+        <button onclick="exportSwZip()" class="spring-btn px-2.5 py-1 rounded-lg text-xs font-mono" style="background: var(--bg-subtle); border: 1px solid var(--border);">Export ZIP</button>
+        <button onclick="closeSwInspector()" class="spring-btn px-2.5 py-1 rounded-lg text-xs" style="background: var(--bg-subtle); border: 1px solid var(--border);">Close</button>
+      </div>
+    </div>
+    <div class="px-6 flex items-center gap-1 pt-2 overflow-x-auto" style="border-bottom: 1px solid var(--border); background: var(--bg-elevated);">
+      <button onclick="setSwTab('overview')" data-swtab="overview" class="sw-tab px-3 py-2 text-xs font-medium border-b-2 whitespace-nowrap">Overview</button>
+      <button onclick="setSwTab('structure')" data-swtab="structure" class="sw-tab px-3 py-2 text-xs font-medium border-b-2 whitespace-nowrap">PE / MSI Tables</button>
+      <button onclick="setSwTab('strings')" data-swtab="strings" class="sw-tab px-3 py-2 text-xs font-medium border-b-2 whitespace-nowrap">Strings &amp; IOCs</button>
+      <button onclick="setSwTab('files')" data-swtab="files" class="sw-tab px-3 py-2 text-xs font-medium border-b-2 whitespace-nowrap">Extracted Files</button>
+      <button onclick="setSwTab('code')" data-swtab="code" class="sw-tab px-3 py-2 text-xs font-medium border-b-2 whitespace-nowrap">Decompiled / Disasm</button>
+    </div>
+    <div id="swDrawerBody" class="p-6 overflow-y-auto flex-1 space-y-5 text-xs"></div>
+  </aside>
 
   <!-- Notion-Style Side-Peek Inspector Drawer -->
   <div id="drawerBackdrop" class="drawer-backdrop fixed inset-0 z-40 bg-black/50 backdrop-blur-sm" onclick="closeInspector()"></div>
@@ -1609,9 +1896,293 @@ function RENDER_DASHBOARD_HTML() {
       else if (e.key === '/') { e.preventDefault(); document.getElementById('searchInput').focus(); }
     });
 
+    const swState = {
+      selectedFile: null,
+      analyses: [],
+      tools: {},
+      inspector: { open: false, slug: null, tab: 'overview', report: null, previewPath: null, previewContent: null }
+    };
+
+    function handleSwFileSelect(e) {
+      const f = e.target.files && e.target.files[0];
+      if (!f) return;
+      swState.selectedFile = f;
+      document.getElementById('swSelectedFileLabel').textContent = 'Selected: ' + f.name + ' (' + formatBytes(f.size) + ')';
+    }
+
+    function handleSwDrop(e) {
+      e.preventDefault();
+      e.currentTarget.style.borderColor = 'var(--border)';
+      const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+      if (!f) return;
+      swState.selectedFile = f;
+      document.getElementById('swSelectedFileLabel').textContent = 'Selected: ' + f.name + ' (' + formatBytes(f.size) + ')';
+    }
+
+    async function loadSoftwareTools() {
+      try {
+        const res = await fetch('/api/software/tools');
+        const data = await res.json();
+        swState.tools = data.tools || {};
+        const keys = ['7z', 'objdump', 'ilspycmd', 'ghidra', 'msiinfo', 'innoextract', 'upx', 'python3'];
+        document.getElementById('swToolsBar').innerHTML = keys.map(k => {
+          const t = swState.tools[k];
+          if (!t) return '';
+          const ok = t.available;
+          const style = ok
+            ? 'background: rgba(16,185,129,0.12); color: #10b981; border: 1px solid rgba(16,185,129,0.3);'
+            : 'background: var(--bg); color: var(--text-dim); border: 1px solid var(--border);';
+          return '<span title="' + escapeHtml(t.version || t.purpose) + '" class="px-2 py-0.5 rounded-md" style="' + style + '">'
+            + (ok ? '✓ ' : '✗ ') + escapeHtml(k) + '</span>';
+        }).join('');
+      } catch {}
+    }
+
+    async function loadSoftwareAnalyses() {
+      try {
+        const res = await fetch('/api/software/list');
+        const data = await res.json();
+        swState.analyses = data.analyses || [];
+        renderSoftwareAnalyses();
+      } catch {}
+    }
+
+    function swStatusBadgeStyle(status) {
+      if (status === 'decompiled' || status === 'extracted') return 'background: rgba(16,185,129,0.12); color: #10b981; border: 1px solid rgba(16,185,129,0.3);';
+      if (status === 'partial') return 'background: rgba(245,158,11,0.12); color: #f59e0b; border: 1px solid rgba(245,158,11,0.3);';
+      return 'background: rgba(239,68,68,0.12); color: #ef4444; border: 1px solid rgba(239,68,68,0.3);';
+    }
+
+    function renderSoftwareAnalyses() {
+      const container = document.getElementById('softwareListContainer');
+      if (!swState.analyses.length) {
+        container.innerHTML = '<div class="rounded-xl p-6 text-center text-xs font-mono" style="background: var(--bg); border: 1px solid var(--border); color: var(--text-dim);">No binaries analyzed yet. Drop an .exe or .msi above to begin.</div>';
+        return;
+      }
+      container.innerHTML = swState.analyses.map(item => {
+        return '<div class="rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3" style="background: var(--bg); border: 1px solid var(--border);">'
+          + '<div class="min-w-0 space-y-1">'
+          + '  <div class="flex flex-wrap items-center gap-2">'
+          + '    <span class="font-mono text-sm font-semibold truncate">' + escapeHtml(item.fileName) + '</span>'
+          + '    <span class="font-mono text-[10px] px-2 py-0.5 rounded" style="' + swStatusBadgeStyle(item.overallStatus) + '">' + escapeHtml(item.overallStatus) + '</span>'
+          + '    <span class="font-mono text-[10px] px-2 py-0.5 rounded" style="background: var(--bg-subtle); border: 1px solid var(--border);">' + escapeHtml(item.kind) + '</span>'
+          + (item.installerFramework ? '<span class="font-mono text-[10px] px-2 py-0.5 rounded" style="background: var(--accent-soft); color: var(--accent);">' + escapeHtml(item.installerFramework) + '</span>' : '')
+          + '  </div>'
+          + '  <div class="font-mono text-[11px] truncate" style="color: var(--text-dim);">'
+          + escapeHtml(item.fileType) + ' • ' + formatBytes(item.size) + ' • SHA256: ' + escapeHtml((item.sha256 || '').slice(0, 16)) + '…'
+          + ' • Extracted: ' + item.extractedCount + ' • Decompiled: ' + item.decompiledCount
+          + '  </div>'
+          + '</div>'
+          + '<div class="flex items-center gap-2 shrink-0">'
+          + '  <button onclick="openSwInspector(\\'' + escapeHtml(item.slug) + '\\')" class="spring-btn px-3 py-1.5 rounded-lg text-xs font-medium" style="background: var(--accent); color: var(--accent-fg);">Inspect</button>'
+          + '  <a href="/api/software/export?name=' + encodeURIComponent(item.slug) + '" class="spring-btn px-3 py-1.5 rounded-lg text-xs font-mono" style="background: var(--bg-subtle); border: 1px solid var(--border);">ZIP</a>'
+          + '</div>'
+          + '</div>';
+      }).join('');
+    }
+
+    function readFileAsBase64(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const res = String(reader.result || '');
+          const idx = res.indexOf(',');
+          resolve(idx >= 0 ? res.slice(idx + 1) : res);
+        };
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+      });
+    }
+
+    async function startSoftwareAnalysis() {
+      const btn = document.getElementById('swAnalyzeBtn');
+      const logPanel = document.getElementById('swLiveLogPanel');
+      const localPath = (document.getElementById('swLocalPathInput').value || '').trim();
+      const extract = document.getElementById('swExtractCheck').checked;
+      const decompile = document.getElementById('swDecompileCheck').checked;
+
+      if (!swState.selectedFile && !localPath) {
+        alert('Please drop/select a file or enter a local server file path.');
+        return;
+      }
+
+      btn.disabled = true;
+      btn.textContent = 'Analyzing...';
+      logPanel.classList.remove('hidden');
+      logPanel.innerHTML = '<div>[init] Starting static analysis &amp; isolated extraction...</div>';
+
+      try {
+        const payload = { localPath, extract, decompile };
+        if (swState.selectedFile) {
+          payload.fileName = swState.selectedFile.name;
+          payload.base64Data = await readFileAsBase64(swState.selectedFile);
+        }
+        const res = await fetch('/api/software/analyze', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Analysis failed');
+
+        const es = new EventSource('/api/software/stream?jobId=' + encodeURIComponent(data.jobId));
+        es.onmessage = (ev) => {
+          const msg = JSON.parse(ev.data);
+          if (msg.type === 'log') {
+            const div = document.createElement('div');
+            div.textContent = msg.line;
+            logPanel.appendChild(div);
+            logPanel.scrollTop = logPanel.scrollHeight;
+          } else if (msg.type === 'done') {
+            es.close();
+            btn.disabled = false;
+            btn.textContent = 'Analyze Binary';
+            loadSoftwareAnalyses();
+            if (msg.code === 0 && msg.slug) openSwInspector(msg.slug);
+          }
+        };
+        es.onerror = () => {
+          es.close();
+          btn.disabled = false;
+          btn.textContent = 'Analyze Binary';
+          loadSoftwareAnalyses();
+        };
+      } catch (err) {
+        const div = document.createElement('div');
+        div.textContent = '[error] ' + err.message;
+        logPanel.appendChild(div);
+        btn.disabled = false;
+        btn.textContent = 'Analyze Binary';
+      }
+    }
+
+    async function openSwInspector(slug) {
+      swState.inspector.open = true;
+      swState.inspector.slug = slug;
+      swState.inspector.tab = 'overview';
+      swState.inspector.previewPath = null;
+      swState.inspector.previewContent = null;
+      document.getElementById('swDrawerBackdrop').classList.add('open');
+      document.getElementById('swInspectorDrawer').classList.add('open');
+      document.getElementById('swDrawerTitle').textContent = slug;
+      document.getElementById('swDrawerBody').innerHTML = '<div class="font-mono p-4">Loading analysis report...</div>';
+
+      const res = await fetch('/api/software/inspect?name=' + encodeURIComponent(slug));
+      const data = await res.json();
+      swState.inspector.report = data.report;
+      const r = data.report;
+      if (r) {
+        document.getElementById('swDrawerTitle').textContent = r.file?.name || slug;
+        document.getElementById('swDrawerSubtitle').textContent = (r.identity?.fileType || '') + ' • SHA256: ' + (r.file?.sha256 || '');
+        const badge = document.getElementById('swDrawerStatusBadge');
+        badge.textContent = r.overallStatus || 'partial';
+        badge.setAttribute('style', swStatusBadgeStyle(r.overallStatus));
+      }
+      renderSwTab();
+    }
+
+    function closeSwInspector() {
+      swState.inspector.open = false;
+      document.getElementById('swDrawerBackdrop').classList.remove('open');
+      document.getElementById('swInspectorDrawer').classList.remove('open');
+    }
+
+    function setSwTab(tab) {
+      swState.inspector.tab = tab;
+      renderSwTab();
+    }
+
+    function exportSwZip() {
+      if (!swState.inspector.slug) return;
+      window.open('/api/software/export?name=' + encodeURIComponent(swState.inspector.slug), '_blank');
+    }
+
+    async function previewSwFile(relPath) {
+      const slug = swState.inspector.slug;
+      if (!slug) return;
+      swState.inspector.previewPath = relPath;
+      swState.inspector.previewContent = 'Loading...';
+      renderSwTab();
+      const res = await fetch('/api/software/file?name=' + encodeURIComponent(slug) + '&path=' + encodeURIComponent(relPath));
+      const data = await res.json();
+      swState.inspector.previewContent = data.content || data.error || '';
+      renderSwTab();
+    }
+
+    function renderSwTab() {
+      document.querySelectorAll('.sw-tab').forEach(btn => {
+        const active = btn.getAttribute('data-swtab') === swState.inspector.tab;
+        btn.style.borderColor = active ? 'var(--accent)' : 'transparent';
+        btn.style.color = active ? 'var(--text)' : 'var(--text-muted)';
+      });
+
+      const r = swState.inspector.report;
+      const body = document.getElementById('swDrawerBody');
+      if (!r) { body.innerHTML = '<div>Report unavailable.</div>'; return; }
+
+      const tab = swState.inspector.tab;
+      if (tab === 'overview') {
+        const id = r.identity || {};
+        const notes = [...(r.notes || []), ...(r.extraction?.notes || []), ...(r.decompilation?.notes || [])];
+        body.innerHTML =
+          '<div class="rounded-xl p-3 font-mono text-[11px]" style="background: rgba(16,185,129,0.08); border: 1px solid rgba(16,185,129,0.25); color: #10b981;">'
+          + escapeHtml(r.safetyNotice || 'Static analysis only.') + '</div>'
+          + '<div class="grid grid-cols-2 gap-3">'
+          + '  <div class="rounded-xl p-3" style="background: var(--bg); border: 1px solid var(--border);"><div style="color: var(--text-dim);">Architecture</div><div class="font-mono font-semibold mt-1">' + escapeHtml(id.architecture || 'N/A') + '</div></div>'
+          + '  <div class="rounded-xl p-3" style="background: var(--bg); border: 1px solid var(--border);"><div style="color: var(--text-dim);">Runtime / Framework</div><div class="font-mono font-semibold mt-1">' + escapeHtml(id.runtime || 'N/A') + '</div></div>'
+          + '  <div class="rounded-xl p-3" style="background: var(--bg); border: 1px solid var(--border);"><div style="color: var(--text-dim);">Installer Framework</div><div class="font-mono font-semibold mt-1">' + escapeHtml(id.installerFramework || 'None detected') + '</div></div>'
+          + '  <div class="rounded-xl p-3" style="background: var(--bg); border: 1px solid var(--border);"><div style="color: var(--text-dim);">Packers</div><div class="font-mono font-semibold mt-1">' + escapeHtml((id.packers && id.packers.length) ? id.packers.join(', ') : 'None detected') + '</div></div>'
+          + '  <div class="rounded-xl p-3" style="background: var(--bg); border: 1px solid var(--border);"><div style="color: var(--text-dim);">Extraction</div><div class="font-mono font-semibold mt-1">' + escapeHtml(r.extraction?.status) + ' (' + (r.extraction?.files?.length || 0) + ' files)</div></div>'
+          + '  <div class="rounded-xl p-3" style="background: var(--bg); border: 1px solid var(--border);"><div style="color: var(--text-dim);">Decompilation</div><div class="font-mono font-semibold mt-1">' + escapeHtml(r.decompilation?.status) + ' (' + (r.decompilation?.files?.length || 0) + ' files)</div></div>'
+          + '</div>'
+          + (notes.length ? '<div class="rounded-xl p-3 space-y-1 font-mono text-[11px]" style="background: var(--bg); border: 1px solid var(--border);"><div class="font-semibold" style="color: var(--text);">Notes &amp; Limitations</div>' + notes.map(n => '<div style="color: var(--text-muted);">• ' + escapeHtml(n) + '</div>').join('') + '</div>' : '');
+      } else if (tab === 'structure') {
+        if (r.pe?.isPE) {
+          const secs = (r.pe.sections || []).map(s => '<tr><td class="py-1 pr-3 font-mono">' + escapeHtml(s.name) + '</td><td class="py-1 pr-3 font-mono">0x' + s.virtualAddress.toString(16) + '</td><td class="py-1 pr-3 font-mono">' + s.rawSize + '</td><td class="py-1 font-mono">' + s.entropy + '</td></tr>').join('');
+          const deps = (r.pe.dependencies || []).map(d => '<span class="px-2 py-0.5 rounded font-mono text-[11px]" style="background: var(--bg-subtle); border: 1px solid var(--border);">' + escapeHtml(d) + '</span>').join('');
+          body.innerHTML =
+            '<div class="rounded-xl p-4 space-y-2" style="background: var(--bg); border: 1px solid var(--border);">'
+            + '<div class="font-semibold">PE Sections</div>'
+            + '<table class="w-full text-left text-[11px]"><thead><tr style="color: var(--text-dim);"><th>Name</th><th>VAddr</th><th>Raw Size</th><th>Entropy</th></tr></thead><tbody>' + secs + '</tbody></table>'
+            + '</div>'
+            + '<div class="rounded-xl p-4 space-y-2" style="background: var(--bg); border: 1px solid var(--border);">'
+            + '<div class="font-semibold">DLL Dependencies (' + (r.pe.dependencies?.length || 0) + ')</div>'
+            + '<div class="flex flex-wrap gap-1.5">' + (deps || '<span style="color: var(--text-dim);">None</span>') + '</div>'
+            + '</div>';
+        } else if (r.msi?.isMsi) {
+          const tblNames = (r.msi.ole2?.tablesDetected || []).join(', ');
+          const cabs = (r.msi.ole2?.embeddedCabs || []).length + ' embedded, ' + (r.msi.ole2?.externalCabs || []).length + ' external';
+          body.innerHTML =
+            '<div class="rounded-xl p-4 space-y-2" style="background: var(--bg); border: 1px solid var(--border);">'
+            + '<div class="font-semibold">MSI OLE2 Container</div>'
+            + '<div class="font-mono text-[11px]" style="color: var(--text-muted);">CABs: ' + escapeHtml(cabs) + '</div>'
+            + '<div class="font-mono text-[11px]" style="color: var(--text-muted);">Tables: ' + escapeHtml(tblNames || 'None') + '</div>'
+            + '</div>'
+            + (r.msi.fileMappings?.length ? '<div class="rounded-xl p-4 space-y-1" style="background: var(--bg); border: 1px solid var(--border);"><div class="font-semibold">File Mappings (' + r.msi.fileMappings.length + ')</div>' + r.msi.fileMappings.slice(0, 100).map(f => '<div class="font-mono text-[11px]" style="color: var(--text-muted);">' + escapeHtml(f.targetPath) + '</div>').join('') + '</div>' : '');
+        } else {
+          body.innerHTML = '<div style="color: var(--text-dim);">No PE or MSI structural metadata available.</div>';
+        }
+      } else if (tab === 'strings') {
+        const s = r.strings || {};
+        const renderList = (title, arr) => '<div class="rounded-xl p-3 space-y-1" style="background: var(--bg); border: 1px solid var(--border);"><div class="font-semibold">' + title + ' (' + (arr?.length || 0) + ')</div>' + ((arr && arr.length) ? arr.slice(0, 60).map(x => '<div class="font-mono text-[11px] break-all" style="color: var(--text-muted);">' + escapeHtml(x) + '</div>').join('') : '<div style="color: var(--text-dim);">None</div>') + '</div>';
+        body.innerHTML = renderList('URLs', s.urls) + renderList('IP Addresses', s.ipAddresses) + renderList('Registry Keys', s.registryKeys) + renderList('Windows Paths', s.paths) + renderList('PDB Debug Paths', s.pdbPaths);
+      } else if (tab === 'files' || tab === 'code') {
+        const isCode = tab === 'code';
+        const basePrefix = isCode ? '' : (r.identity?.kind === 'msi' ? 'extracted/msi/' : r.identity?.kind === 'pyinstaller' ? 'extracted/pyinstaller/' : r.identity?.packers?.includes('UPX') ? 'extracted/unpacked/' : 'extracted/payload/');
+        const list = isCode ? (r.decompilation?.files || []).map(f => f.output) : (r.extraction?.files || []).map(f => basePrefix + f);
+        body.innerHTML =
+          '<div class="space-y-2">'
+          + (list.length ? '<div class="rounded-xl p-3 max-h-56 overflow-y-auto space-y-1" style="background: var(--bg); border: 1px solid var(--border);">' + list.slice(0, 200).map(p => '<button onclick="previewSwFile(\\'' + escapeHtml(p) + '\\')" class="block w-full text-left font-mono text-[11px] px-2 py-1 rounded hover:opacity-80" style="color: var(--accent);">' + escapeHtml(p) + '</button>').join('') + '</div>' : '<div class="rounded-xl p-4" style="background: var(--bg); border: 1px solid var(--border); color: var(--text-dim);">No files available for this stage.</div>')
+          + (swState.inspector.previewPath ? '<div class="rounded-xl p-3 space-y-2" style="background: var(--bg); border: 1px solid var(--border);"><div class="font-mono text-[11px] font-semibold">' + escapeHtml(swState.inspector.previewPath) + '</div><pre class="font-mono text-[11px] overflow-x-auto max-h-96 whitespace-pre-wrap" style="color: var(--text-muted);">' + escapeHtml(swState.inspector.previewContent || '') + '</pre></div>' : '')
+          + '</div>';
+      }
+    }
+
     applyTheme(state.theme);
     setViewMode(state.viewMode);
     loadClones();
+    loadSoftwareTools();
+    loadSoftwareAnalyses();
   </script>
 </body>
 </html>`;

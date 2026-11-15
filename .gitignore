@@ -1,9 +1,10 @@
 # Dependencies
 node_modules/
 
-# Local Clone Outputs (preserve folder structure, ignore actual cloned assets)
+# Local Clone & Analysis Outputs (preserve folder structure, ignore actual cloned/analyzed artifacts)
 clones/*
 !clones/.gitkeep
+analyses/
 
 # Environment & Secrets
 .env
