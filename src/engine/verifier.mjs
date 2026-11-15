@@ -181,12 +181,27 @@ export async function verifyClone(localUrl, outputDir = '.', options = {}) {
         expression: `(() => {
           const imgs = Array.from(document.querySelectorAll('img'));
           const brokenImages = imgs.filter(img => img.getAttribute('src') && (!img.complete || img.naturalWidth === 0)).length;
+          const brokenVideos = Array.from(document.querySelectorAll('video')).filter(v => Boolean(v.error)).length;
+          const brokenFonts = document.fonts
+            ? Array.from(document.fonts).filter(f => f.status === 'error').length
+            : 0;
+          const brokenSvgUses = Array.from(document.querySelectorAll('svg use')).filter(u => {
+            const href = u.getAttribute('href') || u.getAttribute('xlink:href') || '';
+            if (!href.startsWith('#')) return false;
+            return !document.getElementById(href.slice(1));
+          }).length;
           const horizontalOverflow = document.documentElement.scrollWidth > window.innerWidth;
-          return { brokenImages, horizontalOverflow };
+          return { brokenImages, brokenVideos, brokenFonts, brokenSvgUses, horizontalOverflow };
         })()`,
         returnByValue: true
       });
-      return res?.result?.value || { brokenImages: 0, horizontalOverflow: false };
+      return res?.result?.value || {
+        brokenImages: 0,
+        brokenVideos: 0,
+        brokenFonts: 0,
+        brokenSvgUses: 0,
+        horizontalOverflow: false
+      };
     }
 
     // 1. Desktop Audit (1440x900)
@@ -206,6 +221,20 @@ export async function verifyClone(localUrl, outputDir = '.', options = {}) {
     const desktopPath = path.join(outputDir, 'screenshot.png');
     await fs.promises.writeFile(desktopPath, Buffer.from(desktopShot.data, 'base64'));
     log(`  ✓ Desktop screenshot saved: ${desktopPath}`);
+
+    // Optional visual diff against live capture baseline
+    let visualDiff = null;
+    const baselinePath = path.join(outputDir, 'baseline-desktop.png');
+    if (fs.existsSync(baselinePath)) {
+      try {
+        visualDiff = comparePngFiles(baselinePath, desktopPath, {
+          diffOutputPath: path.join(outputDir, 'diff-desktop.png')
+        });
+        log(`  ✓ Visual diff vs baseline: ${visualDiff.diffPercent}% (${visualDiff.mismatchedPixels} px)`);
+      } catch (diffErr) {
+        log(`  ⚠️ Visual diff skipped: ${diffErr.message}`);
+      }
+    }
 
     // 2. Mobile Audit (390x844 iPhone)
     await sendSession('Emulation.setDeviceMetricsOverride', {
@@ -230,7 +259,9 @@ export async function verifyClone(localUrl, outputDir = '.', options = {}) {
       consoleErrors.length === 0 &&
       networkErrors.length === 0 &&
       desktopHealth.brokenImages === 0 &&
-      mobileHealth.brokenImages === 0;
+      mobileHealth.brokenImages === 0 &&
+      desktopHealth.brokenFonts === 0 &&
+      mobileHealth.brokenFonts === 0;
 
     const report = {
       url: localUrl,
@@ -239,7 +270,8 @@ export async function verifyClone(localUrl, outputDir = '.', options = {}) {
       consoleErrors,
       networkErrors,
       desktop: desktopHealth,
-      mobile: mobileHealth
+      mobile: mobileHealth,
+      ...(visualDiff ? { visualDiff } : {})
     };
 
     await fs.promises.writeFile(

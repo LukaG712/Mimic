@@ -6,15 +6,16 @@
  */
 
 import { spawn } from 'child_process';
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { findChromePath, getChromeLaunchArgs } from './chrome_finder.mjs';
 import { isBlockedTrackerUrl, mapUrlToFilePath, rewriteExternalAssetUrls } from './url_mapper.mjs';
 import { runReaWebBundle } from './rea_bridge.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const CHROME_PATH = process.env.CHROME_PATH || 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
 const MAX_CONCURRENCY = 10;
 const COMMAND_TIMEOUT_MS = 15000;
 
@@ -39,6 +40,51 @@ export async function waitForChromeReady(port, maxWaitMs = 5000, isAborted = () 
   throw new Error(`Chrome debug endpoint on port ${port} did not become ready within ${maxWaitMs}ms${lastErr ? `: ${lastErr.message}` : ''}`);
 }
 
+function loadCookiesOption(cookiesOpt, targetUrl) {
+  if (!cookiesOpt) return [];
+  const originUrl = new URL(targetUrl);
+  if (typeof cookiesOpt === 'string' && fs.existsSync(cookiesOpt)) {
+    const raw = JSON.parse(fs.readFileSync(cookiesOpt, 'utf-8'));
+    const list = Array.isArray(raw) ? raw : (raw.cookies || []);
+    return list.map(c => ({
+      name: c.name,
+      value: c.value,
+      domain: c.domain || originUrl.hostname,
+      path: c.path || '/',
+      secure: c.secure ?? originUrl.protocol === 'https:',
+      httpOnly: Boolean(c.httpOnly)
+    }));
+  }
+  if (typeof cookiesOpt === 'string') {
+    return cookiesOpt.split(';').map(pair => {
+      const eq = pair.indexOf('=');
+      if (eq <= 0) return null;
+      return {
+        name: pair.slice(0, eq).trim(),
+        value: pair.slice(eq + 1).trim(),
+        domain: originUrl.hostname,
+        path: '/',
+        secure: originUrl.protocol === 'https:'
+      };
+    }).filter(Boolean);
+  }
+  return Array.isArray(cookiesOpt) ? cookiesOpt : [];
+}
+
+function parseHeadersOption(headersOpt) {
+  if (!headersOpt) return {};
+  if (typeof headersOpt === 'object' && !Array.isArray(headersOpt)) return headersOpt;
+  const arr = Array.isArray(headersOpt) ? headersOpt : [headersOpt];
+  const out = {};
+  for (const h of arr) {
+    const idx = String(h).indexOf(':');
+    if (idx > 0) {
+      out[h.slice(0, idx).trim()] = h.slice(idx + 1).trim();
+    }
+  }
+  return out;
+}
+
 export async function captureRuntime(targetUrl, outputDir, options = {}) {
   const width = options.width || 1440;
   const height = options.height || 900;
@@ -57,21 +103,10 @@ export async function captureRuntime(targetUrl, outputDir, options = {}) {
   log(`🔌 Chrome Debug Port: ${port}`);
   log(`=======================================================\n`);
 
-  if (!fs.existsSync(CHROME_PATH)) {
-    throw new Error(`Chrome executable not found at: ${CHROME_PATH}`);
-  }
-
+  const chromePath = findChromePath();
   fs.mkdirSync(outputDir, { recursive: true });
 
-  const chrome = spawn(CHROME_PATH, [
-    '--headless=new',
-    `--remote-debugging-port=${port}`,
-    '--no-first-run',
-    '--no-default-browser-check',
-    '--disable-background-networking',
-    '--disable-gpu',
-    'about:blank'
-  ]);
+  const chrome = spawn(chromePath, getChromeLaunchArgs(port, { headless: !options.interactiveLogin }));
 
   let ws;
   let overallTimer;
@@ -102,6 +137,8 @@ export async function captureRuntime(targetUrl, outputDir, options = {}) {
     let msgId = 1;
     let activeSessionId = null;
     const pendingResponses = new Map();
+    const requestMeta = new Map();
+    const recordedFixtures = {};
     const inflightRequests = new Set();
     let lastNetworkActivity = Date.now();
     const taskQueue = [];
@@ -211,6 +248,10 @@ export async function captureRuntime(targetUrl, outputDir, options = {}) {
         if (reqUrl && !reqUrl.startsWith('data:') && !reqUrl.startsWith('blob:') && !isBlockedTrackerUrl(reqUrl)) {
           inflightRequests.add(data.params.requestId);
           lastNetworkActivity = Date.now();
+          requestMeta.set(data.params.requestId, {
+            method: (data.params.request.method || 'GET').toUpperCase(),
+            postData: data.params.request.postData || ''
+          });
         }
       } else if (data.method === 'Network.responseReceived') {
         const { requestId, response } = data.params;
@@ -218,6 +259,7 @@ export async function captureRuntime(targetUrl, outputDir, options = {}) {
         if (isBlockedTrackerUrl(assetUrl)) {
           skippedTrackers++;
           inflightRequests.delete(requestId);
+          requestMeta.delete(requestId);
           return;
         }
         if (response && (response.status === 200 || response.status === 206)) {
@@ -232,6 +274,7 @@ export async function captureRuntime(targetUrl, outputDir, options = {}) {
       } else if (data.method === 'Network.loadingFailed') {
         const { requestId } = data.params;
         pendingResponses.delete(requestId);
+        requestMeta.delete(requestId);
         inflightRequests.delete(requestId);
         lastNetworkActivity = Date.now();
       } else if (data.method === 'Network.loadingFinished') {
@@ -239,6 +282,8 @@ export async function captureRuntime(targetUrl, outputDir, options = {}) {
         inflightRequests.delete(requestId);
         lastNetworkActivity = Date.now();
         const info = pendingResponses.get(requestId);
+        const meta = requestMeta.get(requestId) || { method: 'GET', postData: '' };
+        requestMeta.delete(requestId);
         if (info) {
           pendingResponses.delete(requestId);
           totalQueued++;
@@ -246,11 +291,40 @@ export async function captureRuntime(targetUrl, outputDir, options = {}) {
             try {
               const bodyRes = await sendSession('Network.getResponseBody', { requestId });
               if (bodyRes && typeof bodyRes.body === 'string') {
+                const buf = bodyRes.base64Encoded
+                  ? Buffer.from(bodyRes.body, 'base64')
+                  : Buffer.from(bodyRes.body, 'utf-8');
+                const cleanMime = (info.mimeType || 'application/octet-stream').split(';')[0].trim().toLowerCase();
+
+                // Record API / JSON / GraphQL fixtures for deterministic offline replay
+                try {
+                  const parsedAssetUrl = new URL(info.url, targetUrl);
+                  const isApiLike =
+                    meta.method !== 'GET' ||
+                    cleanMime.includes('json') ||
+                    parsedAssetUrl.pathname.startsWith('/api/') ||
+                    parsedAssetUrl.pathname.startsWith('/_next/data/') ||
+                    parsedAssetUrl.pathname.includes('graphql');
+                  if (isApiLike && buf.length > 0 && buf.length <= 1024 * 1024) {
+                    const bodyHash = meta.postData
+                      ? crypto.createHash('md5').update(meta.postData).digest('hex').slice(0, 8)
+                      : '';
+                    const exactKey = `${meta.method}:${parsedAssetUrl.pathname}${parsedAssetUrl.search}${bodyHash ? `:${bodyHash}` : ''}`;
+                    const fallbackKey = `${meta.method}:${parsedAssetUrl.pathname}`;
+                    const fixtureEntry = {
+                      status: info.status,
+                      contentType: info.mimeType || 'application/json; charset=utf-8',
+                      body: buf.toString('utf-8')
+                    };
+                    recordedFixtures[exactKey] = fixtureEntry;
+                    if (!recordedFixtures[fallbackKey]) {
+                      recordedFixtures[fallbackKey] = fixtureEntry;
+                    }
+                  }
+                } catch {}
+
                 const mapped = mapUrlToFilePath(info.url, targetUrl, outputDir, info.mimeType);
                 if (mapped && mapped.diskPath) {
-                  const buf = bodyRes.base64Encoded
-                    ? Buffer.from(bodyRes.body, 'base64')
-                    : Buffer.from(bodyRes.body, 'utf-8');
                   await ensureDir(path.dirname(mapped.diskPath));
                   await fs.promises.writeFile(mapped.diskPath, buf);
 
@@ -260,7 +334,6 @@ export async function captureRuntime(targetUrl, outputDir, options = {}) {
                     } catch {}
                   }
 
-                  const cleanMime = (info.mimeType || 'application/octet-stream').split(';')[0].trim().toLowerCase();
                   if (!mimeBreakdown[cleanMime]) mimeBreakdown[cleanMime] = { count: 0, bytes: 0 };
                   mimeBreakdown[cleanMime].count++;
                   mimeBreakdown[cleanMime].bytes += buf.length;
@@ -303,6 +376,18 @@ export async function captureRuntime(targetUrl, outputDir, options = {}) {
     await sendSession('Runtime.enable');
     await sendSession('Network.enable');
 
+    const extraHeaders = parseHeadersOption(options.headers);
+    if (Object.keys(extraHeaders).length > 0) {
+      await sendSession('Network.setExtraHTTPHeaders', { headers: extraHeaders });
+      log(`▶ Applied ${Object.keys(extraHeaders).length} custom HTTP header(s)`);
+    }
+
+    const cookiesToSet = loadCookiesOption(options.cookies, targetUrl);
+    if (cookiesToSet.length > 0) {
+      await sendSession('Network.setCookies', { cookies: cookiesToSet });
+      log(`▶ Injected ${cookiesToSet.length} session cookie(s)`);
+    }
+
     await sendSession('Emulation.setDeviceMetricsOverride', {
       width,
       height,
@@ -312,6 +397,17 @@ export async function captureRuntime(targetUrl, outputDir, options = {}) {
 
     log(`▶ Navigating to ${targetUrl}...`);
     await sendSession('Page.navigate', { url: targetUrl });
+
+    if (options.interactiveLogin) {
+      log(`🔐 Interactive login mode: complete authentication in the Chrome window, then press [Enter] here to capture...`);
+      await new Promise((resolve) => {
+        process.stdin.resume();
+        process.stdin.once('data', () => {
+          process.stdin.pause();
+          resolve();
+        });
+      });
+    }
 
     // Wait for network idle rather than blind sleep
     await waitForNetworkIdle(waitMs, 500);
@@ -467,7 +563,7 @@ export async function captureRuntime(targetUrl, outputDir, options = {}) {
       }
     }
 
-    // Capture screenshot
+    // Capture screenshot + live baseline for visual diffing
     log(`▶ Capturing high-resolution viewport screenshot...`);
     const screenshot = await sendSession('Page.captureScreenshot', {
       format: 'png',
@@ -475,22 +571,18 @@ export async function captureRuntime(targetUrl, outputDir, options = {}) {
     });
 
     const screenshotPath = path.join(outputDir, 'screenshot.png');
+    const baselinePath = path.join(outputDir, 'baseline-desktop.png');
     const shotBuf = Buffer.from(screenshot.data, 'base64');
     await fs.promises.writeFile(screenshotPath, shotBuf);
+    await fs.promises.writeFile(baselinePath, shotBuf);
     screenshotBytes = shotBuf.length;
     log(`  ✓ Saved screenshot to screenshot.png (${screenshotBytes.toLocaleString()} bytes)`);
 
-    // Optional REA live bundle analysis before closing Chrome
+    // Optional REA live bundle analysis before crawling / closing Chrome
     let reaSummary = null;
     if (options.rea && !aborted) {
       try {
         await send('Target.detachFromTarget', { sessionId: activeSessionId });
-      } catch {}
-      try {
-        if (ws) {
-          ws.close();
-          ws = null;
-        }
       } catch {}
 
       log(`▶ Running REA static bundle & endpoint analysis...`);
@@ -503,6 +595,106 @@ export async function captureRuntime(targetUrl, outputDir, options = {}) {
       } catch (reaErr) {
         log(`  ⚠️ REA bundle analysis skipped: ${reaErr.message}`);
       }
+
+      if (options.crawl && !aborted) {
+        try {
+          const reattachRes = await send('Target.attachToTarget', { targetId, flatten: true });
+          activeSessionId = reattachRes.sessionId;
+          await sendSession('Page.enable');
+          await sendSession('Runtime.enable');
+          await sendSession('Network.enable');
+        } catch {}
+      } else {
+        try {
+          if (ws) {
+            ws.close();
+            ws = null;
+          }
+        } catch {}
+      }
+    }
+
+    // Optional multi-route SPA crawl within the same CDP session (DOM links + REA routes)
+    const crawledRoutes = [];
+    if (options.crawl && !aborted) {
+      const maxRoutes = Math.max(1, Math.min(50, parseInt(options.maxRoutes || '10', 10)));
+      const origin = new URL(targetUrl).origin;
+      const linkRes = await sendSession('Runtime.evaluate', {
+        expression: `(() => {
+          const out = [];
+          const seen = new Set();
+          for (const a of document.querySelectorAll('a[href]')) {
+            try {
+              const u = new URL(a.getAttribute('href'), window.location.href);
+              if (u.origin === ${JSON.stringify(origin)} && u.pathname !== window.location.pathname) {
+                const p = u.pathname.replace(/\\/+$/, '') || '/';
+                if (!seen.has(p) && !p.match(/\\.(png|jpg|jpeg|gif|svg|pdf|zip|css|js)$/i)) {
+                  seen.add(p);
+                  out.push(p);
+                }
+              }
+            } catch {}
+          }
+          return out;
+        })()`,
+        returnByValue: true
+      });
+
+      const mergedSet = new Set(linkRes?.result?.value || []);
+      for (const r of (reaSummary?.routes || [])) {
+        if (typeof r === 'string' && r.startsWith('/') && !r.includes(':') && !r.includes('[') && !r.includes('*')) {
+          const clean = r.replace(/\/+$/, '') || '/';
+          if (clean !== '/') mergedSet.add(clean);
+        }
+      }
+
+      const discoveredRoutes = [...mergedSet].slice(0, maxRoutes);
+      if (discoveredRoutes.length > 0) {
+        log(`▶ Crawling ${discoveredRoutes.length} internal route(s)...`);
+      }
+      for (const routePath of discoveredRoutes) {
+        if (aborted) break;
+        const routeUrl = `${origin}${routePath}`;
+        try {
+          log(`  ↪ Navigating route: ${routePath}`);
+          await sendSession('Page.navigate', { url: routeUrl });
+          await waitForNetworkIdle(Math.min(waitMs, 2500), 400);
+          await waitForQueueDrain(8000);
+          const routeDomRes = await sendSession('Runtime.evaluate', {
+            expression: 'document.documentElement ? document.documentElement.outerHTML : ""',
+            returnByValue: true
+          });
+          let routeHtml = routeDomRes?.result?.value || '';
+          if (routeHtml) {
+            if (!routeHtml.trim().toLowerCase().startsWith('<!doctype')) {
+              routeHtml = '<!DOCTYPE html>\n' + routeHtml;
+            }
+            routeHtml = rewriteExternalAssetUrls(routeHtml, capturedExternalHosts);
+            const cleanSegs = routePath.replace(/^\/+|\/+$/g, '');
+            const routeFile = cleanSegs
+              ? path.join(outputDir, cleanSegs, 'index.html')
+              : path.join(outputDir, 'index.html');
+            await ensureDir(path.dirname(routeFile));
+            await fs.promises.writeFile(routeFile, routeHtml, 'utf-8');
+            crawledRoutes.push(routePath);
+          }
+        } catch {
+          // Continue crawling remaining routes
+        }
+      }
+    }
+
+    // Persist recorded API / JSON fixtures for deterministic offline replay
+    const fixtureCount = Object.keys(recordedFixtures).length;
+    if (fixtureCount > 0) {
+      const mocksDir = path.join(outputDir, 'mocks');
+      await ensureDir(mocksDir);
+      await fs.promises.writeFile(
+        path.join(mocksDir, 'fixtures.json'),
+        JSON.stringify(recordedFixtures, null, 2),
+        'utf-8'
+      );
+      log(`  ✓ Recorded ${fixtureCount} API fixture key(s) to mocks/fixtures.json`);
     }
 
     // Scaffold standalone clone server and manifests
@@ -517,6 +709,8 @@ export async function captureRuntime(targetUrl, outputDir, options = {}) {
       assetCount,
       skippedTrackers,
       totalBytes,
+      fixtureCount,
+      crawledRoutes,
       externalHosts: [...capturedExternalHosts],
       mimeBreakdown,
       page: extracted.page || {},
@@ -540,6 +734,8 @@ export async function captureRuntime(targetUrl, outputDir, options = {}) {
       assetCount,
       skippedTrackers,
       totalBytes,
+      fixtureCount,
+      crawledRoutes,
       externalHosts: [...capturedExternalHosts],
       ...(reaSummary ? { rea: reaSummary } : {})
     };
@@ -668,7 +864,7 @@ if (process.argv[1] && process.argv[1].endsWith('cdp_capture.mjs')) {
   const outArg = positional[1] || './clones/captured-site';
   const portArg = parseInt(flags.port || positional[2] || '3000', 10);
   if (!urlArg) {
-    console.log('Usage: node cdp_capture.mjs <url> [outputDir] [port] [--quiet] [--json] [--no-scroll] [--timeout 60000] [--rea] [--fetch-source-maps]');
+    console.log('Usage: node cdp_capture.mjs <url> [outputDir] [port] [--quiet] [--json] [--no-scroll] [--timeout 60000] [--rea] [--fetch-source-maps] [--crawl] [--max-routes 10] [--cookies <file|str>] [--header "K: V"]');
     process.exit(1);
   }
 
@@ -679,7 +875,12 @@ if (process.argv[1] && process.argv[1].endsWith('cdp_capture.mjs')) {
     scroll: flags['no-scroll'] ? false : true,
     timeout: flags.timeout ? parseInt(flags.timeout, 10) : undefined,
     rea: Boolean(flags.rea),
-    fetchSourceMaps: Boolean(flags['fetch-source-maps'])
+    fetchSourceMaps: Boolean(flags['fetch-source-maps']),
+    crawl: Boolean(flags.crawl),
+    maxRoutes: flags['max-routes'] ? parseInt(flags['max-routes'], 10) : undefined,
+    cookies: flags.cookies,
+    headers: flags.header,
+    interactiveLogin: Boolean(flags['interactive-login'])
   })
     .then((res) => {
       if (flags.json) console.log(JSON.stringify(res));

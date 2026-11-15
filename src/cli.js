@@ -30,11 +30,19 @@ Commands:
   analyze <name> [--full-evidence]     Run REA static JS application graph analysis
   serve [name] [--port 3000]           Start hybrid fallback server for cloned site
   verify [name] [--port 3000]          Audit console errors, layout & capture screenshots
+  export <name> [--format zip|docker]  Package a clone as a .zip archive or Dockerfile
+  remove <name>                        Delete a cloned project from workspace
   list                                 Show all cloned projects in workspace
   help                                 Show this guide
 
 Options:
   --port <num>                         Local server port (default: 3000)
+  --offline                            Disable upstream fallback when serving
+  --crawl                              Crawl internal same-origin routes during capture
+  --max-routes <num>                   Max internal routes to crawl (default: 10)
+  --cookies <file|str>                 Cookies JSON file or header string for capture
+  --header <k:v>                       Custom HTTP header for capture
+  --interactive-login                  Open headed browser and wait for Enter before capture
   --rea                                Run REA live bundle & endpoint analysis during capture
   --fetch-source-maps                  Fetch source maps when running capture with --rea
   --quiet                              Suppress verbose progress output
@@ -42,10 +50,11 @@ Options:
 
 Examples:
   node src/cli.js clone https://linear.app linear-clone --port 3001
-  node src/cli.js capture https://linear.app linear-runtime --port 3003 --rea --json
+  node src/cli.js capture https://linear.app linear-runtime --port 3003 --rea --crawl --json
   node src/cli.js analyze linear-runtime --json
-  node src/cli.js serve linear-clone
+  node src/cli.js serve linear-clone --offline
   node src/cli.js verify linear-clone --json
+  node src/cli.js export linear-runtime --format zip
 `);
 }
 
@@ -178,6 +187,11 @@ async function main() {
       if (options.timeout) cdpArgs.push('--timeout', String(options.timeout));
       if (options.rea) cdpArgs.push('--rea');
       if (options['fetch-source-maps']) cdpArgs.push('--fetch-source-maps');
+      if (options.crawl) cdpArgs.push('--crawl');
+      if (options['max-routes']) cdpArgs.push('--max-routes', String(options['max-routes']));
+      if (options.cookies) cdpArgs.push('--cookies', String(options.cookies));
+      if (options.header) cdpArgs.push('--header', String(options.header));
+      if (options['interactive-login']) cdpArgs.push('--interactive-login');
 
       const proc = spawn('node', cdpArgs, { stdio: 'inherit' });
       proc.on('close', (code) => {
@@ -235,9 +249,10 @@ async function main() {
 
       const env = { ...process.env };
       if (options.port) env.PORT = String(options.port);
+      if (options.offline) env.MIMIC_OFFLINE = '1';
 
       if (!options.quiet) {
-        console.log(`Starting server for \x1b[36m${path.basename(targetDir)}\x1b[0m...`);
+        console.log(`Starting server for \x1b[36m${path.basename(targetDir)}\x1b[0m${options.offline ? ' (strict offline)' : ''}...`);
       }
       const proc = spawn('node', ['server.js'], { cwd: targetDir, stdio: 'inherit', env });
       break;
@@ -259,6 +274,69 @@ async function main() {
       proc.on('close', (code) => {
         if (code !== 0) process.exit(code);
       });
+      break;
+    }
+
+    case 'export': {
+      const name = positional[0];
+      if (!name) {
+        console.error('❌ Error: Missing clone name. Usage: node src/cli.js export <name> [--format zip|docker]');
+        process.exit(1);
+      }
+      const targetDir = resolveProjectDir(name);
+      if (!fs.existsSync(targetDir)) {
+        console.error(`❌ Error: Clone directory not found: ${targetDir}`);
+        process.exit(1);
+      }
+      const format = (options.format || 'zip').toLowerCase();
+      const slug = path.basename(targetDir);
+      if (format === 'docker') {
+        const dockerfile = `FROM node:22-alpine\nWORKDIR /app\nCOPY . .\nENV PORT=3000\nEXPOSE 3000\nCMD ["node", "server.js"]\n`;
+        const dockerignore = `node_modules\n*.zip\naudit-*.png\ndiff-*.png\n`;
+        fs.writeFileSync(path.join(targetDir, 'Dockerfile'), dockerfile, 'utf8');
+        fs.writeFileSync(path.join(targetDir, '.dockerignore'), dockerignore, 'utf8');
+        if (options.json) {
+          console.log(JSON.stringify({ ok: true, format: 'docker', path: path.join(targetDir, 'Dockerfile') }));
+        } else {
+          console.log(`✓ Generated Dockerfile and .dockerignore in ${targetDir}`);
+        }
+      } else {
+        const outZip = options.out ? path.resolve(options.out) : path.join(CLONES_DIR, `${slug}.zip`);
+        const pyZip = spawn('python3', [
+          '-c',
+          'import shutil, sys; shutil.make_archive(sys.argv[1][:-4], "zip", sys.argv[2])',
+          outZip,
+          targetDir
+        ], { stdio: 'inherit' });
+        pyZip.on('close', (code) => {
+          if (code !== 0) process.exit(code);
+          if (options.json) {
+            console.log(JSON.stringify({ ok: true, format: 'zip', path: outZip }));
+          } else if (!options.quiet) {
+            console.log(`✓ Exported ${slug} to ${outZip}`);
+          }
+        });
+      }
+      break;
+    }
+
+    case 'remove': {
+      const name = positional[0];
+      if (!name) {
+        console.error('❌ Error: Missing clone name. Usage: node src/cli.js remove <name>');
+        process.exit(1);
+      }
+      const targetDir = resolveProjectDir(name);
+      if (!fs.existsSync(targetDir)) {
+        console.error(`❌ Error: Clone directory not found: ${targetDir}`);
+        process.exit(1);
+      }
+      fs.rmSync(targetDir, { recursive: true, force: true });
+      if (options.json) {
+        console.log(JSON.stringify({ ok: true, removed: targetDir }));
+      } else if (!options.quiet) {
+        console.log(`✓ Removed clone: ${targetDir}`);
+      }
       break;
     }
 

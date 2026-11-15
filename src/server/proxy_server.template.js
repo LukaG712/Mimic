@@ -20,6 +20,17 @@ const PORT = parseInt(process.env.PORT || '{{PORT}}', 10);
 const ROOT = __dirname;
 const RESOLVED_ROOT = path.resolve(ROOT);
 const UPSTREAM = '{{UPSTREAM}}';
+const OFFLINE_MODE = process.env.MIMIC_OFFLINE === '1' || process.argv.includes('--offline');
+
+const RECORDED_FIXTURES = (() => {
+  try {
+    const fPath = path.join(RESOLVED_ROOT, 'mocks', 'fixtures.json');
+    if (fs.existsSync(fPath)) {
+      return JSON.parse(fs.readFileSync(fPath, 'utf8'));
+    }
+  } catch {}
+  return {};
+})();
 
 const DISCOVERED_ENDPOINTS = new Set();
 try {
@@ -190,22 +201,70 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // API Mock Layer (handles POST/PUT/DELETE mutations and REA-discovered API routes without local files)
+  // API Mock & Fixture Replay Layer
+  const method = (req.method || 'GET').toUpperCase();
+  const search = parsedUrl.search || '';
+  const hasRecordedFixture = Boolean(
+    RECORDED_FIXTURES[`${method}:${pathname}${search}`] ||
+    RECORDED_FIXTURES[`${method}:${pathname}`]
+  );
   const isDiscoveredEndpoint = DISCOVERED_ENDPOINTS.has(pathname);
-  if (pathname.startsWith('/api/') || pathname.startsWith('/_next/data/') || isDiscoveredEndpoint) {
+  if (
+    hasRecordedFixture ||
+    method === 'POST' ||
+    method === 'PUT' ||
+    method === 'DELETE' ||
+    pathname.startsWith('/api/') ||
+    pathname.startsWith('/_next/data/') ||
+    isDiscoveredEndpoint
+  ) {
     const candidateLocal = path.resolve(RESOLVED_ROOT, '.' + pathname);
     if (!isPathInsideRoot(candidateLocal)) {
       res.writeHead(403, { 'Content-Type': 'text/plain' });
       res.end('403 Forbidden');
       return;
     }
-    if (req.method === 'POST' || req.method === 'PUT' || req.method === 'DELETE' || (isDiscoveredEndpoint && !fs.existsSync(candidateLocal))) {
-      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify({ ok: true, status: 'success', mocked: true, endpoint: pathname, timestamp: Date.now() }));
+
+    const replyWithFixturesOrMock = (rawBody) => {
+      const bodyHash = rawBody ? crypto.createHash('md5').update(rawBody).digest('hex').slice(0, 8) : '';
+      const fixture =
+        (bodyHash && RECORDED_FIXTURES[`${method}:${pathname}${search}:${bodyHash}`]) ||
+        RECORDED_FIXTURES[`${method}:${pathname}${search}`] ||
+        RECORDED_FIXTURES[`${method}:${pathname}`];
+
+      if (fixture) {
+        res.writeHead(fixture.status || 200, {
+          'Content-Type': fixture.contentType || 'application/json; charset=utf-8',
+          'X-Mimic-Fixture': 'replayed'
+        });
+        res.end(fixture.body);
+        return;
+      }
+
+      if (method === 'POST' || method === 'PUT' || method === 'DELETE' || (isDiscoveredEndpoint && !fs.existsSync(candidateLocal))) {
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: true, status: 'success', mocked: true, endpoint: pathname, timestamp: Date.now() }));
+        return;
+      }
+      // Fall through to static file serving for GET /api/* when no fixture and file may exist locally
+      serveStaticOrFallback();
+    };
+
+    if (method === 'POST' || method === 'PUT' || method === 'DELETE') {
+      const chunks = [];
+      req.on('data', c => chunks.push(c));
+      req.on('end', () => replyWithFixturesOrMock(Buffer.concat(chunks).toString('utf8')));
+      return;
+    }
+    if (hasRecordedFixture || isDiscoveredEndpoint) {
+      replyWithFixturesOrMock('');
       return;
     }
   }
 
+  serveStaticOrFallback();
+
+  function serveStaticOrFallback() {
   if (pathname === '/') {
     pathname = '/index.html';
   }
@@ -270,28 +329,32 @@ const server = http.createServer((req, res) => {
       return;
     }
 
-    // External CDN route cache miss: /external/<host>/<rest>
-    if (pathname.startsWith('/external/')) {
-      const extMatch = pathname.match(/^\/external\/([^/]+)\/(.+)$/);
-      if (extMatch) {
-        const externalUpstreamUrl = `https://${extMatch[1]}/${extMatch[2]}${parsedUrl.search || ''}`;
-        console.log(`[External Cache Miss] Fetching from CDN: ${externalUpstreamUrl}`);
-        fetchUpstream(externalUpstreamUrl, filePath, req.headers, res);
+    if (!OFFLINE_MODE) {
+      // External CDN route cache miss: /external/<host>/<rest>
+      if (pathname.startsWith('/external/')) {
+        const extMatch = pathname.match(/^\/external\/([^/]+)\/(.+)$/);
+        if (extMatch) {
+          const externalUpstreamUrl = `https://${extMatch[1]}/${extMatch[2]}${parsedUrl.search || ''}`;
+          console.log(`[External Cache Miss] Fetching from CDN: ${externalUpstreamUrl}`);
+          fetchUpstream(externalUpstreamUrl, filePath, req.headers, res);
+          return;
+        }
+      }
+
+      // Asset missing locally: Fetch from Upstream
+      if (UPSTREAM && UPSTREAM !== 'https://example.com') {
+        const upstreamUrl = url.resolve(UPSTREAM, req.url);
+        console.log(`[Cache Miss] Fetching from upstream: ${upstreamUrl}`);
+        let cachePath = filePath;
+        if (parsedUrl.search && !path.extname(cachePath)) {
+          const qHash = crypto.createHash('md5').update(parsedUrl.search).digest('hex').slice(0, 8);
+          cachePath = `${cachePath}_${qHash}`;
+        }
+        fetchUpstream(upstreamUrl, cachePath, req.headers, res);
         return;
       }
-    }
-
-    // Asset missing locally: Fetch from Upstream
-    if (UPSTREAM && UPSTREAM !== 'https://example.com') {
-      const upstreamUrl = url.resolve(UPSTREAM, req.url);
-      console.log(`[Cache Miss] Fetching from upstream: ${upstreamUrl}`);
-      let cachePath = filePath;
-      if (parsedUrl.search && !path.extname(cachePath)) {
-        const qHash = crypto.createHash('md5').update(parsedUrl.search).digest('hex').slice(0, 8);
-        cachePath = `${cachePath}_${qHash}`;
-      }
-      fetchUpstream(upstreamUrl, cachePath, req.headers, res);
-      return;
+    } else {
+      console.warn(`[Offline Miss] ${req.url}`);
     }
 
     // Fallback: If no extension, serve index.html (SPA routing)
@@ -303,11 +366,12 @@ const server = http.createServer((req, res) => {
     }
 
     res.writeHead(404, { 'Content-Type': 'text/plain' });
-    res.end('404 Not Found');
+    res.end(OFFLINE_MODE ? '404 Not Found (Strict Offline Mode)' : '404 Not Found');
   });
+  }
 });
 
 server.listen(PORT, () => {
   console.log(`🚀 Cloned site running at http://localhost:${PORT}`);
-  console.log(`📡 Upstream fallback target: ${UPSTREAM}`);
+  console.log(`📡 Mode: ${OFFLINE_MODE ? 'Strict Offline (no upstream fallback)' : `Hybrid Proxy (${UPSTREAM})`}`);
 });

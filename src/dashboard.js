@@ -150,7 +150,7 @@ async function waitForHttpPort(port, maxWaitMs = 4000) {
   return false;
 }
 
-function startCloneServer(match) {
+function startCloneServer(match, offline = false) {
   if (activeServers.has(match.name)) {
     return { child: activeServers.get(match.name), startedTransiently: false };
   }
@@ -158,9 +158,11 @@ function startCloneServer(match) {
   if (!fs.existsSync(serverPath)) {
     throw new Error(`server.js missing in ${match.path}`);
   }
+  const env = { ...process.env, PORT: String(match.port) };
+  if (offline) env.MIMIC_OFFLINE = '1';
   const child = spawn('node', ['server.js'], {
     cwd: match.path,
-    env: { ...process.env, PORT: String(match.port) },
+    env,
     stdio: 'ignore'
   });
   activeServers.set(match.name, child);
@@ -194,9 +196,36 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (parsed.pathname === '/api/clone/stream' && req.method === 'GET') {
+    const jobId = String(parsed.query.jobId || '');
+    const job = captureJobs.get(jobId);
+    if (!job) {
+      sendJson(res, 404, { error: 'Capture job not found' });
+      return;
+    }
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive'
+    });
+    for (const line of job.logs) {
+      res.write(`data: ${JSON.stringify({ type: 'log', line })}\n\n`);
+    }
+    if (job.done) {
+      res.write(`data: ${JSON.stringify({ type: 'done', code: job.code, slug: job.slug })}\n\n`);
+      res.end();
+      return;
+    }
+    job.clients.add(res);
+    req.on('close', () => {
+      job.clients.delete(res);
+    });
+    return;
+  }
+
   if (parsed.pathname === '/api/clone' && req.method === 'POST') {
     try {
-      const { targetUrl, name, port, engine = 'cdp', rea = true, fetchSourceMaps = false } = await readJsonBody(req);
+      const { targetUrl, name, port, engine = 'cdp', rea = true, fetchSourceMaps = false, crawl = false, cookies = '', headers = '' } = await readJsonBody(req);
       if (!targetUrl) {
         sendJson(res, 400, { error: 'Missing targetUrl' });
         return;
@@ -208,35 +237,125 @@ const server = http.createServer(async (req, res) => {
         .replace(/^-+|-+$/g, '') || 'cloned-site';
       const targetDir = path.join(CLONES_DIR, slug);
       const assignedPort = port || (3010 + Math.floor(Math.random() * 80));
+      const jobId = `${slug}-${Date.now()}`;
 
       let child;
       if (engine === 'static') {
         const pythonScript = path.join(__dirname, 'engine', 'cloner.py');
-        child = spawn('python', [pythonScript, '--url', targetUrl, '--out', targetDir, '--port', String(assignedPort)], {
-          stdio: 'inherit'
+        child = spawn('python3', [pythonScript, '--url', targetUrl, '--out', targetDir, '--port', String(assignedPort)], {
+          stdio: ['ignore', 'pipe', 'pipe']
         });
       } else {
         const cdpScript = path.join(__dirname, 'engine', 'cdp_capture.mjs');
         const cdpArgs = [cdpScript, targetUrl, targetDir, String(assignedPort)];
         if (rea) cdpArgs.push('--rea');
         if (rea && fetchSourceMaps) cdpArgs.push('--fetch-source-maps');
-        child = spawn('node', cdpArgs, { stdio: 'inherit' });
+        if (crawl) cdpArgs.push('--crawl');
+        if (cookies && String(cookies).trim()) cdpArgs.push('--cookies', String(cookies).trim());
+        if (headers && String(headers).trim()) cdpArgs.push('--header', String(headers).trim());
+        child = spawn('node', cdpArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
+      }
+
+      const job = { id: jobId, slug, logs: [], clients: new Set(), done: false, code: null };
+      captureJobs.set(jobId, job);
+
+      const pushLine = (line) => {
+        const clean = line.trimEnd();
+        if (!clean) return;
+        job.logs.push(clean);
+        if (job.logs.length > 250) job.logs.shift();
+        for (const client of job.clients) {
+          client.write(`data: ${JSON.stringify({ type: 'log', line: clean })}\n\n`);
+        }
+      };
+
+      for (const stream of [child.stdout, child.stderr]) {
+        if (!stream) continue;
+        let buf = '';
+        stream.on('data', (chunk) => {
+          buf += chunk.toString('utf8');
+          const lines = buf.split(/\r?\n/);
+          buf = lines.pop() || '';
+          lines.forEach(pushLine);
+        });
       }
 
       child.on('close', (code) => {
+        job.done = true;
+        job.code = code;
+        for (const client of job.clients) {
+          client.write(`data: ${JSON.stringify({ type: 'done', code, slug })}\n\n`);
+          client.end();
+        }
+        job.clients.clear();
+        setTimeout(() => captureJobs.delete(jobId), 5 * 60 * 1000);
         console.log(`Cloning (${engine}) finished for ${slug} with code ${code}`);
       });
 
-      sendJson(res, 200, { ok: true, slug, targetDir, port: assignedPort, engine, rea: Boolean(rea) });
+      sendJson(res, 200, { ok: true, jobId, slug, targetDir, port: assignedPort, engine, rea: Boolean(rea), crawl: Boolean(crawl) });
     } catch (err) {
       sendJson(res, 500, { error: err.message });
     }
     return;
   }
 
+  if (parsed.pathname === '/api/clone' && req.method === 'DELETE') {
+    const name = String(parsed.query.name || '');
+    const clones = getAllClones();
+    const match = clones.find(c => c.name === name);
+    if (!match) {
+      sendJson(res, 404, { error: `Clone "${name}" not found` });
+      return;
+    }
+    const proc = activeServers.get(match.name);
+    if (proc) {
+      try { proc.kill(); } catch {}
+      activeServers.delete(match.name);
+    }
+    fs.rmSync(match.path, { recursive: true, force: true });
+    sendJson(res, 200, { ok: true, removed: match.name });
+    return;
+  }
+
+  if (parsed.pathname === '/api/export' && req.method === 'GET') {
+    const name = String(parsed.query.name || '');
+    const format = String(parsed.query.format || 'zip').toLowerCase();
+    const clones = getAllClones();
+    const match = clones.find(c => c.name === name);
+    if (!match) {
+      sendJson(res, 404, { error: `Clone "${name}" not found` });
+      return;
+    }
+    if (format === 'docker') {
+      const dockerfile = `FROM node:22-alpine\nWORKDIR /app\nCOPY . .\nENV PORT=3000\nEXPOSE 3000\nCMD ["node", "server.js"]\n`;
+      fs.writeFileSync(path.join(match.path, 'Dockerfile'), dockerfile, 'utf8');
+      sendJson(res, 200, { ok: true, format: 'docker', path: path.join(match.path, 'Dockerfile') });
+      return;
+    }
+    const zipPath = path.join(CLONES_DIR, `${match.name}.zip`);
+    const pyZip = spawn('python3', [
+      '-c',
+      'import shutil, sys; shutil.make_archive(sys.argv[1][:-4], "zip", sys.argv[2])',
+      zipPath,
+      match.path
+    ]);
+    pyZip.on('close', (code) => {
+      if (code !== 0 || !fs.existsSync(zipPath)) {
+        sendJson(res, 500, { error: 'Failed to build zip archive' });
+        return;
+      }
+      res.writeHead(200, {
+        'Content-Type': 'application/zip',
+        'Content-Disposition': `attachment; filename="${match.name}.zip"`
+      });
+      fs.createReadStream(zipPath).pipe(res);
+    });
+    return;
+  }
+
   if (parsed.pathname === '/api/serve' && req.method === 'POST') {
     try {
-      const { name, action = 'start' } = await readJsonBody(req);
+      const { name, action = 'start', offline = false } = await readJsonBody(req);
       const clones = getAllClones();
       const match = clones.find(c => c.name === name);
       if (!match) {
@@ -254,8 +373,8 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      startCloneServer(match);
-      sendJson(res, 200, { ok: true, name: match.name, running: true, port: match.port });
+      startCloneServer(match, Boolean(offline));
+      sendJson(res, 200, { ok: true, name: match.name, running: true, port: match.port, offline: Boolean(offline) });
     } catch (err) {
       sendJson(res, 500, { error: err.message });
     }
@@ -343,7 +462,9 @@ const server = http.createServer(async (req, res) => {
       const candidates =
         viewport === 'mobile'
           ? ['screenshot_mobile.png', 'audit-mobile.png']
-          : ['screenshot.png', 'audit-desktop.png'];
+          : viewport === 'diff'
+            ? ['diff-desktop.png']
+            : ['screenshot.png', 'audit-desktop.png'];
       for (const file of candidates) {
         const candidatePath = path.join(match.path, file);
         if (fs.existsSync(candidatePath)) {
@@ -668,8 +789,23 @@ function RENDER_DASHBOARD_HTML() {
             <input id="sourceMapsCheck" type="checkbox" />
             <span>Fetch source maps</span>
           </label>
+          <label class="inline-flex items-center gap-2 cursor-pointer select-none">
+            <input id="crawlCheck" type="checkbox" />
+            <span>Crawl internal routes (<code class="font-mono">--crawl</code>)</span>
+          </label>
+          <label class="inline-flex items-center gap-2 cursor-pointer select-none">
+            <input id="offlineServeCheck" type="checkbox" />
+            <span>Strict offline serve</span>
+          </label>
+        </div>
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
+          <input id="cookiesInput" type="text" placeholder="Cookies JSON path or 'session=abc; ...' (optional)" class="w-full px-3 py-2 rounded-xl text-xs font-mono" />
+          <input id="headerInput" type="text" placeholder="Custom header e.g. Authorization: Bearer ... (optional)" class="w-full px-3 py-2 rounded-xl text-xs font-mono" />
         </div>
       </form>
+
+      <div id="liveLogPanel" class="hidden rounded-xl p-3 font-mono text-[11px] max-h-44 overflow-y-auto space-y-0.5" style="background: var(--bg); border: 1px solid var(--border); color: var(--text-muted);"></div>
 
       <!-- Stripe Connected Node Pipeline Visualizer -->
       <div id="pipelineFlow" class="pt-2">
@@ -966,6 +1102,8 @@ function RENDER_DASHBOARD_HTML() {
             + '<td class="py-3 px-4 text-right space-x-1.5 whitespace-nowrap">'
             + '<button onclick="toggleServer(\\'' + jsName + '\\', ' + c.running + ')" class="spring-btn px-2 py-1 rounded text-[11px] font-mono" style="background: var(--bg-subtle); border: 1px solid var(--border);">' + (c.running ? 'Stop' : 'Start') + '</button>'
             + '<button onclick="openInspector(\\'' + jsName + '\\')" class="spring-btn px-2 py-1 rounded text-[11px] font-mono" style="background: var(--bg-subtle); border: 1px solid var(--border);">Inspect</button>'
+            + '<a href="/api/export?name=' + encodeURIComponent(c.name) + '&format=zip" class="spring-btn px-2 py-1 rounded text-[11px] font-mono" style="background: var(--bg-subtle); border: 1px solid var(--border);">ZIP</a>'
+            + '<button onclick="deleteClone(\\'' + jsName + '\\')" class="spring-btn px-2 py-1 rounded text-[11px] font-mono" style="background: var(--danger-soft); color: var(--danger); border: 1px solid var(--danger);">Del</button>'
             + '</td></tr>';
         }).join('');
 
@@ -1013,11 +1151,13 @@ function RENDER_DASHBOARD_HTML() {
           + (swatches ? '<div class="flex items-center gap-1.5 pt-1">' + swatches + '</div>' : '')
           + '</div></div>'
           + '<div class="px-4 py-2.5 flex items-center justify-between gap-1.5 text-xs" style="border-top: 1px solid var(--border); background: var(--bg);">'
-          + '<div class="flex items-center gap-1.5">'
+          + '<div class="flex items-center gap-1.5 flex-wrap">'
           + '<button onclick="toggleServer(\\'' + jsName + '\\', ' + c.running + ')" class="spring-btn px-2.5 py-1 rounded-lg font-medium" style="background:' + (c.running ? 'var(--danger-soft)' : 'var(--ok-soft)') + '; color:' + (c.running ? 'var(--danger)' : 'var(--ok)') + '; border: 1px solid ' + (c.running ? 'var(--danger)' : 'var(--ok)') + ';">' + (c.running ? 'Stop' : 'Start') + '</button>'
           + '<button onclick="openInspector(\\'' + jsName + '\\')" class="spring-btn px-2.5 py-1 rounded-lg font-medium" style="background: var(--bg-subtle); border: 1px solid var(--border);">Inspect</button>'
           + '<button onclick="analyzeClone(\\'' + jsName + '\\', this)" class="spring-btn px-2 py-1 rounded-lg font-mono text-[11px]" style="background: var(--accent-soft); color: var(--accent); border: 1px solid var(--accent);">REA</button>'
           + '<button onclick="verifyProject(\\'' + jsName + '\\', this)" class="spring-btn px-2 py-1 rounded-lg font-mono text-[11px]" style="background: var(--bg-subtle); border: 1px solid var(--border);">Verify</button>'
+          + '<a href="/api/export?name=' + encodeURIComponent(c.name) + '&format=zip" class="spring-btn px-2 py-1 rounded-lg font-mono text-[11px]" style="background: var(--bg-subtle); border: 1px solid var(--border);">ZIP</a>'
+          + '<button onclick="deleteClone(\\'' + jsName + '\\')" title="Delete clone" class="spring-btn px-2 py-1 rounded-lg font-mono text-[11px]" style="background: var(--danger-soft); color: var(--danger); border: 1px solid var(--danger);">Del</button>'
           + '</div>'
           + '<a href="http://localhost:' + c.port + '" target="_blank" class="spring-btn px-2.5 py-1 rounded-lg font-medium" style="background: var(--text); color: var(--bg);">Open</a>'
           + '</div></div>';
@@ -1056,13 +1196,28 @@ function RENDER_DASHBOARD_HTML() {
 
     async function toggleServer(name, isRunning) {
       setPipelineStage(4, [1, 2, 3]);
+      const offlineEl = document.getElementById('offlineServeCheck');
+      const offline = Boolean(offlineEl && offlineEl.checked);
       await fetch('/api/serve', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, action: isRunning ? 'stop' : 'start' })
+        body: JSON.stringify({ name, action: isRunning ? 'stop' : 'start', offline })
       });
       await loadClones();
       setPipelineStage(0, isRunning ? [] : [4]);
+    }
+
+    async function deleteClone(name) {
+      try {
+        const res = await fetch('/api/clone?name=' + encodeURIComponent(name), { method: 'DELETE' });
+        const d = await res.json();
+        if (!res.ok) throw new Error(d.error || 'Delete failed');
+        showNotice('Removed clone "' + name + '".');
+        if (state.inspector.open && state.inspector.name === name) closeInspector();
+        await loadClones();
+      } catch (err) {
+        showNotice('Delete error: ' + err.message);
+      }
     }
 
     async function triggerClone(e) {
@@ -1072,10 +1227,18 @@ function RENDER_DASHBOARD_HTML() {
       const engine = document.getElementById('engineSelect').value;
       const rea = document.getElementById('reaCheck').checked;
       const fetchSourceMaps = document.getElementById('sourceMapsCheck').checked;
+      const crawl = document.getElementById('crawlCheck').checked;
+      const cookies = (document.getElementById('cookiesInput')?.value || '').trim();
+      const headers = (document.getElementById('headerInput')?.value || '').trim();
       const btn = document.getElementById('submitBtn');
+      const logPanel = document.getElementById('liveLogPanel');
 
       btn.disabled = true;
       btn.textContent = 'Capturing...';
+      if (logPanel) {
+        logPanel.innerHTML = '';
+        logPanel.classList.remove('hidden');
+      }
       setPipelineStage(2, [1]);
       showNotice('Capturing ' + targetUrl + ' via ' + engine.toUpperCase() + (rea && engine === 'cdp' ? ' + REA' : '') + '...');
 
@@ -1083,18 +1246,48 @@ function RENDER_DASHBOARD_HTML() {
         const res = await fetch('/api/clone', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ targetUrl, name, engine, rea, fetchSourceMaps })
+          body: JSON.stringify({ targetUrl, name, engine, rea, fetchSourceMaps, crawl, cookies, headers })
         });
         const d = await res.json();
         if (!res.ok) throw new Error(d.error || 'Clone failed');
         setPipelineStage(rea ? 3 : 4, [1, 2]);
-        showNotice('Pipeline started for "' + d.slug + '" on port :' + d.port + '. Polling workspace...');
-        setTimeout(() => {
-          loadClones();
-          btn.disabled = false;
-          btn.textContent = 'Start Capture';
-          setPipelineStage(0, [1, 2, 3, 4]);
-        }, 4500);
+        showNotice('Pipeline started for "' + d.slug + '" on port :' + d.port + '. Streaming live logs...');
+
+        if (d.jobId && typeof EventSource !== 'undefined') {
+          const es = new EventSource('/api/clone/stream?jobId=' + encodeURIComponent(d.jobId));
+          es.onmessage = (ev) => {
+            try {
+              const msg = JSON.parse(ev.data);
+              if (msg.type === 'log' && logPanel) {
+                const lineEl = document.createElement('div');
+                lineEl.textContent = msg.line;
+                logPanel.appendChild(lineEl);
+                logPanel.scrollTop = logPanel.scrollHeight;
+              } else if (msg.type === 'done') {
+                es.close();
+                loadClones();
+                btn.disabled = false;
+                btn.textContent = 'Start Capture';
+                setPipelineStage(0, [1, 2, 3, 4]);
+                showNotice('Capture finished for "' + d.slug + '" (exit ' + msg.code + ').');
+              }
+            } catch {}
+          };
+          es.onerror = () => {
+            es.close();
+            loadClones();
+            btn.disabled = false;
+            btn.textContent = 'Start Capture';
+            setPipelineStage(0, [1, 2, 3, 4]);
+          };
+        } else {
+          setTimeout(() => {
+            loadClones();
+            btn.disabled = false;
+            btn.textContent = 'Start Capture';
+            setPipelineStage(0, [1, 2, 3, 4]);
+          }, 4500);
+        }
       } catch (err) {
         showNotice('Capture error: ' + err.message);
         btn.disabled = false;
@@ -1229,13 +1422,20 @@ function RENDER_DASHBOARD_HTML() {
           '<tr style="border-top: 1px solid var(--border);"><td class="py-1.5 pr-3 font-mono text-[11px]" style="color: var(--accent);">' + escapeHtml(k) + '</td><td class="py-1.5 font-mono text-[11px]">' + escapeHtml(v) + '</td></tr>'
         ).join('');
 
+        const crawled = (m.crawledRoutes || []).map(r =>
+          '<span class="font-mono text-[11px] px-2 py-0.5 rounded" style="background: var(--bg-subtle); border: 1px solid var(--border);">' + escapeHtml(r) + '</span>'
+        ).join(' ');
+
         body.innerHTML =
-          '<div class="grid grid-cols-4 gap-3">'
+          '<div class="grid grid-cols-3 sm:grid-cols-6 gap-3">'
           + '<div class="surface p-3 rounded-xl"><div class="text-[10px] font-mono" style="color: var(--text-dim);">DOM</div><div class="font-mono text-sm font-semibold tabular-nums mt-0.5">' + formatBytes(m.domBytes || 0) + '</div></div>'
           + '<div class="surface p-3 rounded-xl"><div class="text-[10px] font-mono" style="color: var(--text-dim);">ASSETS</div><div class="font-mono text-sm font-semibold tabular-nums mt-0.5">' + (m.assetCount || 0) + '</div></div>'
-          + '<div class="surface p-3 rounded-xl"><div class="text-[10px] font-mono" style="color: var(--text-dim);">TRACKERS</div><div class="font-mono text-sm font-semibold tabular-nums mt-0.5">' + (m.skippedTrackers || 0) + ' skipped</div></div>'
+          + '<div class="surface p-3 rounded-xl"><div class="text-[10px] font-mono" style="color: var(--text-dim);">TRACKERS</div><div class="font-mono text-sm font-semibold tabular-nums mt-0.5">' + (m.skippedTrackers || 0) + '</div></div>'
           + '<div class="surface p-3 rounded-xl"><div class="text-[10px] font-mono" style="color: var(--text-dim);">CDNS</div><div class="font-mono text-sm font-semibold tabular-nums mt-0.5">' + ((m.externalHosts || []).length) + '</div></div>'
+          + '<div class="surface p-3 rounded-xl"><div class="text-[10px] font-mono" style="color: var(--text-dim);">FIXTURES</div><div class="font-mono text-sm font-semibold tabular-nums mt-0.5">' + (m.fixtureCount || 0) + '</div></div>'
+          + '<div class="surface p-3 rounded-xl"><div class="text-[10px] font-mono" style="color: var(--text-dim);">ROUTES</div><div class="font-mono text-sm font-semibold tabular-nums mt-0.5">' + ((m.crawledRoutes || []).length) + '</div></div>'
           + '</div>'
+          + (crawled ? '<div><div class="font-medium mb-2">Crawled routes</div><div class="flex flex-wrap gap-1.5">' + crawled + '</div></div>' : '')
           + '<div><div class="font-medium mb-2">Extracted palette</div><div class="flex flex-wrap gap-2">' + (colors || '<span style="color: var(--text-dim);">No manifest palette recorded yet.</span>') + '</div></div>'
           + '<div><div class="font-medium mb-2">Fonts</div>' + (fonts || '<span style="color: var(--text-dim);">None recorded.</span>') + '</div>'
           + (cssVars ? '<div><div class="font-medium mb-2">CSS custom properties</div><table class="w-full">' + cssVars + '</table></div>' : '');
@@ -1274,16 +1474,25 @@ function RENDER_DASHBOARD_HTML() {
         const errorsList = (ar?.consoleErrors || []).concat(ar?.networkErrors || []).map(e =>
           '<div class="font-mono text-[11px] p-2 rounded" style="background: var(--danger-soft); color: var(--danger);">' + escapeHtml(e) + '</div>'
         ).join('');
+        const vd = ar?.visualDiff;
 
         body.innerHTML =
           '<div class="flex items-center justify-between gap-2">'
           + '<div class="inline-flex rounded-lg p-0.5" style="background: var(--bg-elevated); border: 1px solid var(--border);">'
           + '<button onclick="setAuditViewport(\\'desktop\\')" class="px-3 py-1 rounded-md text-xs font-medium" style="background:' + (vp === 'desktop' ? 'var(--bg-subtle)' : 'transparent') + ';">Desktop 1440×900</button>'
           + '<button onclick="setAuditViewport(\\'mobile\\')" class="px-3 py-1 rounded-md text-xs font-medium" style="background:' + (vp === 'mobile' ? 'var(--bg-subtle)' : 'transparent') + ';">Mobile 390×844</button>'
+          + (vd ? '<button onclick="setAuditViewport(\\'diff\\')" class="px-3 py-1 rounded-md text-xs font-medium" style="background:' + (vp === 'diff' ? 'var(--bg-subtle)' : 'transparent') + ';">Diff (' + vd.diffPercent + '%)</button>' : '')
           + '</div>'
           + '<button onclick="verifyProject(\\'' + jsName + '\\', this)" class="spring-btn px-3 py-1.5 rounded-lg font-medium" style="background: var(--accent); color: var(--accent-fg);">Run Verify Audit</button>'
           + '</div>'
-          + (ar ? '<div class="grid grid-cols-4 gap-3"><div class="surface p-3 rounded-xl"><div class="text-[10px] font-mono" style="color: var(--text-dim);">STATUS</div><div class="font-mono text-sm font-semibold" style="color:' + (ar.passed ? 'var(--ok)' : 'var(--danger)') + ';">' + (ar.passed ? 'PASS' : 'ISSUES') + '</div></div><div class="surface p-3 rounded-xl"><div class="text-[10px] font-mono" style="color: var(--text-dim);">CONSOLE ERR</div><div class="font-mono text-sm font-semibold tabular-nums">' + ar.consoleErrors.length + '</div></div><div class="surface p-3 rounded-xl"><div class="text-[10px] font-mono" style="color: var(--text-dim);">HTTP 4xx/5xx</div><div class="font-mono text-sm font-semibold tabular-nums">' + ar.networkErrors.length + '</div></div><div class="surface p-3 rounded-xl"><div class="text-[10px] font-mono" style="color: var(--text-dim);">BROKEN IMG</div><div class="font-mono text-sm font-semibold tabular-nums">' + (ar.desktop?.brokenImages ?? 0) + ' / ' + (ar.mobile?.brokenImages ?? 0) + '</div></div></div>' : '<div style="color: var(--text-muted);">No audit-report.json yet. Run Verify Audit to test console errors, broken images, and mobile overflow.</div>')
+          + (ar ? '<div class="grid grid-cols-3 sm:grid-cols-6 gap-3">'
+            + '<div class="surface p-3 rounded-xl"><div class="text-[10px] font-mono" style="color: var(--text-dim);">STATUS</div><div class="font-mono text-sm font-semibold" style="color:' + (ar.passed ? 'var(--ok)' : 'var(--danger)') + ';">' + (ar.passed ? 'PASS' : 'ISSUES') + '</div></div>'
+            + '<div class="surface p-3 rounded-xl"><div class="text-[10px] font-mono" style="color: var(--text-dim);">CONSOLE</div><div class="font-mono text-sm font-semibold tabular-nums">' + ar.consoleErrors.length + '</div></div>'
+            + '<div class="surface p-3 rounded-xl"><div class="text-[10px] font-mono" style="color: var(--text-dim);">HTTP ERR</div><div class="font-mono text-sm font-semibold tabular-nums">' + ar.networkErrors.length + '</div></div>'
+            + '<div class="surface p-3 rounded-xl"><div class="text-[10px] font-mono" style="color: var(--text-dim);">BROKEN IMG</div><div class="font-mono text-sm font-semibold tabular-nums">' + (ar.desktop?.brokenImages ?? 0) + ' / ' + (ar.mobile?.brokenImages ?? 0) + '</div></div>'
+            + '<div class="surface p-3 rounded-xl"><div class="text-[10px] font-mono" style="color: var(--text-dim);">FONTS/SVG</div><div class="font-mono text-sm font-semibold tabular-nums">' + ((ar.desktop?.brokenFonts ?? 0) + (ar.desktop?.brokenSvgUses ?? 0)) + '</div></div>'
+            + '<div class="surface p-3 rounded-xl"><div class="text-[10px] font-mono" style="color: var(--text-dim);">VISUAL DIFF</div><div class="font-mono text-sm font-semibold tabular-nums">' + (vd ? (vd.diffPercent + '%') : '—') + '</div></div>'
+            + '</div>' : '<div style="color: var(--text-muted);">No audit-report.json yet. Run Verify Audit to test console errors, broken images, and mobile overflow.</div>')
           + '<div class="rounded-xl overflow-hidden" style="border: 1px solid var(--border);"><img src="' + imgUrl + '" alt="Audit viewport preview" class="w-full h-auto bg-black/20" onerror="this.style.display=\\'none\\'" /></div>'
           + (errorsList ? '<div class="space-y-1.5"><div class="font-medium">Deduplicated issues</div>' + errorsList + '</div>' : '');
         return;
