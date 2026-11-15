@@ -9,6 +9,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { runReaAppAnalysis } from './engine/rea_bridge.mjs';
+import { unpackDesktopApp } from './engine/desktop_unpacker.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -27,10 +28,11 @@ Usage:
 Commands:
   clone <url> [name] [--port 3000]     Run parallel static & font extraction clone
   capture <url> [name] [--port 3000]   Run in-flight CDP stream capture & scaffolding
+  unpack <asar|dir> [name]             Unpack an Electron .asar or app folder into a clone
   analyze <name> [--full-evidence]     Run REA static JS application graph analysis
   serve [name] [--port 3000]           Start hybrid fallback server for cloned site
   verify [name] [--port 3000]          Audit console errors, layout & capture screenshots
-  export <name> [--format zip|docker]  Package a clone as a .zip archive or Dockerfile
+  export <name> [--format zip|docker|electron]  Package clone (.zip, Docker, or Windows .exe/.msi Electron)
   remove <name>                        Delete a cloned project from workspace
   list                                 Show all cloned projects in workspace
   help                                 Show this guide
@@ -277,10 +279,28 @@ async function main() {
       break;
     }
 
+    case 'unpack': {
+      const inputPath = positional[0];
+      if (!inputPath) {
+        console.error('❌ Error: Missing .asar or app directory path. Usage: node src/cli.js unpack <path> [name]');
+        process.exit(1);
+      }
+      const slug = positional[1] || (path.basename(path.resolve(inputPath)).replace(/[^a-zA-Z0-9-_]/g, '-') || 'desktop-app');
+      const targetDir = path.join(CLONES_DIR, slug);
+      const port = options.port || 3000;
+      const result = unpackDesktopApp(inputPath, targetDir, { port });
+      if (options.json) {
+        console.log(JSON.stringify({ ok: true, ...result }));
+      } else if (!options.quiet) {
+        console.log(`✓ Unpacked ${result.fileCount} files (${result.totalBytes} B) from ${result.asarFile} -> ${result.outputDir}`);
+      }
+      break;
+    }
+
     case 'export': {
       const name = positional[0];
       if (!name) {
-        console.error('❌ Error: Missing clone name. Usage: node src/cli.js export <name> [--format zip|docker]');
+        console.error('❌ Error: Missing clone name. Usage: node src/cli.js export <name> [--format zip|docker|electron]');
         process.exit(1);
       }
       const targetDir = resolveProjectDir(name);
@@ -299,6 +319,54 @@ async function main() {
           console.log(JSON.stringify({ ok: true, format: 'docker', path: path.join(targetDir, 'Dockerfile') }));
         } else {
           console.log(`✓ Generated Dockerfile and .dockerignore in ${targetDir}`);
+        }
+      } else if (format === 'electron') {
+        const electronMain = `const { app, BrowserWindow } = require('electron');
+const path = require('path');
+const { spawn } = require('child_process');
+
+let srvProc;
+function createWindow() {
+  const port = process.env.PORT || '3000';
+  srvProc = spawn(process.execPath, [path.join(__dirname, 'server.js')], {
+    cwd: __dirname,
+    env: { ...process.env, PORT: port, MIMIC_OFFLINE: '1' },
+    stdio: 'ignore'
+  });
+  const win = new BrowserWindow({ width: 1280, height: 840, autoHideMenuBar: true });
+  setTimeout(() => win.loadURL('http://127.0.0.1:' + port), 350);
+}
+app.whenReady().then(createWindow);
+app.on('window-all-closed', () => {
+  if (srvProc) try { srvProc.kill(); } catch {}
+  if (process.platform !== 'darwin') app.quit();
+});
+`;
+        fs.writeFileSync(path.join(targetDir, 'electron-main.js'), electronMain, 'utf8');
+        const pkgPath = path.join(targetDir, 'package.json');
+        const pkg = fs.existsSync(pkgPath) ? JSON.parse(fs.readFileSync(pkgPath, 'utf8')) : { name: slug, version: '1.0.0' };
+        pkg.main = 'electron-main.js';
+        pkg.scripts = {
+          ...(pkg.scripts || {}),
+          'electron': 'electron .',
+          'build:win': 'electron-builder --win nsis msi'
+        };
+        pkg.build = {
+          appId: `com.mimic.${slug.replace(/[^a-z0-9]/gi, '')}`,
+          productName: slug,
+          win: { target: ['nsis', 'msi'] }
+        };
+        pkg.devDependencies = {
+          ...(pkg.devDependencies || {}),
+          electron: '^33.0.0',
+          'electron-builder': '^25.0.0'
+        };
+        fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2), 'utf8');
+        if (options.json) {
+          console.log(JSON.stringify({ ok: true, format: 'electron', path: path.join(targetDir, 'electron-main.js') }));
+        } else if (!options.quiet) {
+          console.log(`✓ Generated Electron Windows (.exe NSIS + .msi) wrapper in ${targetDir}`);
+          console.log(`  Run inside ${targetDir}: npm install && npm run build:win`);
         }
       } else {
         const outZip = options.out ? path.resolve(options.out) : path.join(CLONES_DIR, `${slug}.zip`);
