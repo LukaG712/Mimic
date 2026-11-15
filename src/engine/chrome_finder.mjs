@@ -73,6 +73,10 @@ export function getChromeLaunchArgs(port, options = {}) {
     args.push('--no-sandbox', '--disable-setuid-sandbox');
   }
 
+  if (options.ignoreCertErrors || process.env.HTTPS_PROXY || process.env.https_proxy) {
+    args.push('--ignore-certificate-errors');
+  }
+
   args.push('about:blank');
   return args;
 }

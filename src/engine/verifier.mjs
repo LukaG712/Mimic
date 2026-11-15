@@ -8,8 +8,9 @@ import { spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { waitForChromeReady } from './cdp_capture.mjs';
+import { findChromePath, getChromeLaunchArgs } from './chrome_finder.mjs';
+import { comparePngFiles } from './png_diff.mjs';
 
-const CHROME_PATH = process.env.CHROME_PATH || 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
 const COMMAND_TIMEOUT_MS = 15000;
 
 function formatDeduplicatedMap(map) {
@@ -35,21 +36,10 @@ export async function verifyClone(localUrl, outputDir = '.', options = {}) {
   log(`🔌 Chrome Debug Port: ${port}`);
   log(`=======================================================\n`);
 
-  if (!fs.existsSync(CHROME_PATH)) {
-    throw new Error(`Chrome executable not found at: ${CHROME_PATH}`);
-  }
-
+  const chromePath = findChromePath();
   fs.mkdirSync(outputDir, { recursive: true });
 
-  const chrome = spawn(CHROME_PATH, [
-    '--headless=new',
-    `--remote-debugging-port=${port}`,
-    '--no-first-run',
-    '--no-default-browser-check',
-    '--disable-background-networking',
-    '--disable-gpu',
-    'about:blank'
-  ]);
+  const chrome = spawn(chromePath, getChromeLaunchArgs(port));
 
   let ws;
   let overallTimer;
