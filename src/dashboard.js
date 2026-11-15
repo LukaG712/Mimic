@@ -5,6 +5,7 @@
 
 import http from 'http';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import url from 'url';
 import { spawn } from 'child_process';
@@ -12,7 +13,7 @@ import { fileURLToPath } from 'url';
 import { runReaAppAnalysis } from './engine/rea_bridge.mjs';
 import { verifyClone } from './engine/verifier.mjs';
 import { analyzeSoftware } from './reverse/orchestrator/analysis_pipeline.mjs';
-import { discoverTools, isSafeSubpath } from './reverse/orchestrator/tool_registry.mjs';
+import { discoverTools, isSafeSubpath, resolvePythonExecutable } from './reverse/orchestrator/tool_registry.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -168,6 +169,9 @@ function getAllSoftwareAnalyses() {
       installerFramework: report.identity?.installerFramework || null,
       packers: report.identity?.packers || [],
       overallStatus: report.overallStatus || 'partial',
+      extractionStatus: report.extraction?.status || 'not_run',
+      decompilationStatus: report.decompilation?.status || 'not_run',
+      durationMs: report.durationMs || 0,
       extractedCount: report.extraction?.files?.length || 0,
       decompiledCount: report.decompilation?.files?.length || 0
     });
@@ -273,18 +277,23 @@ const server = http.createServer(async (req, res) => {
   if (parsed.pathname === '/api/software/export' && req.method === 'GET') {
     const name = String(parsed.query.name || '').replace(/[^a-zA-Z0-9._-]/g, '');
     const analysisDir = path.join(ANALYSES_DIR, name);
-    if (!name || !isSafeSubpath(ANALYSES_DIR, analysisDir) || !fs.existsSync(analysisDir)) {
+    if (!name || name === '.' || name === '..' || !isSafeSubpath(ANALYSES_DIR, analysisDir) || !fs.existsSync(analysisDir)) {
       sendJson(res, 404, { error: 'Analysis not found' });
       return;
     }
-    const zipBase = path.join(ANALYSES_DIR, `${name}-package`);
+    const pyBin = resolvePythonExecutable();
+    if (!pyBin) {
+      sendJson(res, 500, { error: 'Python 3 executable not found for ZIP export' });
+      return;
+    }
+    const zipBase = path.join(os.tmpdir(), `mimic-${name}-${Date.now()}`);
     const zipPath = `${zipBase}.zip`;
-    const pyZip = spawn('python3', [
+    const pyZip = spawn(pyBin, [
       '-c',
       'import shutil, sys; shutil.make_archive(sys.argv[1], "zip", sys.argv[2])',
       zipBase,
       analysisDir
-    ], { stdio: 'ignore' });
+    ], { stdio: 'ignore', windowsHide: true });
     pyZip.on('close', (code) => {
       if (code !== 0 || !fs.existsSync(zipPath)) {
         sendJson(res, 500, { error: 'Failed to create ZIP archive' });
@@ -294,7 +303,11 @@ const server = http.createServer(async (req, res) => {
         'Content-Type': 'application/zip',
         'Content-Disposition': `attachment; filename="${name}-analysis.zip"`
       });
-      fs.createReadStream(zipPath).pipe(res);
+      const stream = fs.createReadStream(zipPath);
+      const cleanup = () => { try { fs.unlinkSync(zipPath); } catch {} };
+      stream.on('close', cleanup);
+      stream.on('error', cleanup);
+      stream.pipe(res);
     });
     return;
   }
@@ -340,8 +353,13 @@ const server = http.createServer(async (req, res) => {
         const safeName = rawName.replace(/[^a-zA-Z0-9._-]/g, '_') || 'sample.bin';
         targetPath = path.join(inputDir, safeName);
         fs.writeFileSync(targetPath, Buffer.from(base64Data, 'base64'));
-      } else if (localPath && fs.existsSync(String(localPath))) {
-        targetPath = path.resolve(String(localPath));
+      } else if (localPath) {
+        const candidate = path.resolve(String(localPath));
+        if (!fs.existsSync(candidate) || !fs.statSync(candidate).isFile()) {
+          sendJson(res, 400, { error: 'localPath must point to an existing regular file' });
+          return;
+        }
+        targetPath = candidate;
       } else {
         sendJson(res, 400, { error: 'Provide either base64Data upload or a valid localPath' });
         return;
@@ -387,7 +405,7 @@ const server = http.createServer(async (req, res) => {
           setTimeout(() => softwareJobs.delete(jobId), 5 * 60 * 1000);
         });
 
-      sendJson(res, 200, { ok: true, jobId, slug, outDir });
+      sendJson(res, 200, { ok: true, jobId, slug });
     } catch (err) {
       sendJson(res, 400, { error: err.message });
     }
@@ -455,9 +473,15 @@ const server = http.createServer(async (req, res) => {
 
       let child;
       if (engine === 'static') {
+        const pyBin = resolvePythonExecutable();
+        if (!pyBin) {
+          sendJson(res, 500, { error: 'Python 3 executable not found for static engine' });
+          return;
+        }
         const pythonScript = path.join(__dirname, 'engine', 'cloner.py');
-        child = spawn('python3', [pythonScript, '--url', targetUrl, '--out', targetDir, '--port', String(assignedPort)], {
-          stdio: ['ignore', 'pipe', 'pipe']
+        child = spawn(pyBin, [pythonScript, '--url', targetUrl, '--out', targetDir, '--port', String(assignedPort)], {
+          stdio: ['ignore', 'pipe', 'pipe'],
+          windowsHide: true
         });
       } else {
         const cdpScript = path.join(__dirname, 'engine', 'cdp_capture.mjs');
@@ -546,13 +570,18 @@ const server = http.createServer(async (req, res) => {
       sendJson(res, 200, { ok: true, format: 'docker', path: path.join(match.path, 'Dockerfile') });
       return;
     }
+    const pyBin = resolvePythonExecutable();
+    if (!pyBin) {
+      sendJson(res, 500, { error: 'Python 3 executable not found for zip export' });
+      return;
+    }
     const zipPath = path.join(CLONES_DIR, `${match.name}.zip`);
-    const pyZip = spawn('python3', [
+    const pyZip = spawn(pyBin, [
       '-c',
       'import shutil, sys; shutil.make_archive(sys.argv[1][:-4], "zip", sys.argv[2])',
       zipPath,
       match.path
-    ]);
+    ], { stdio: 'ignore', windowsHide: true });
     pyZip.on('close', (code) => {
       if (code !== 0 || !fs.existsSync(zipPath)) {
         sendJson(res, 500, { error: 'Failed to build zip archive' });
@@ -1970,11 +1999,13 @@ function RENDER_DASHBOARD_HTML() {
           + '  </div>'
           + '  <div class="font-mono text-[11px] truncate" style="color: var(--text-dim);">'
           + escapeHtml(item.fileType) + ' • ' + formatBytes(item.size) + ' • SHA256: ' + escapeHtml((item.sha256 || '').slice(0, 16)) + '…'
-          + ' • Extracted: ' + item.extractedCount + ' • Decompiled: ' + item.decompiledCount
+          + ' • Extract: ' + escapeHtml(item.extractionStatus || 'n/a') + ' (' + item.extractedCount + ')'
+          + ' • Decompile: ' + escapeHtml(item.decompilationStatus || 'n/a') + ' (' + item.decompiledCount + ')'
+          + (item.durationMs ? ' • ' + item.durationMs + 'ms' : '')
           + '  </div>'
           + '</div>'
           + '<div class="flex items-center gap-2 shrink-0">'
-          + '  <button onclick="openSwInspector(\\'' + escapeHtml(item.slug) + '\\')" class="spring-btn px-3 py-1.5 rounded-lg text-xs font-medium" style="background: var(--accent); color: var(--accent-fg);">Inspect</button>'
+          + '  <button data-swslug="' + escapeHtml(item.slug) + '" onclick="openSwInspector(this.getAttribute(\\'data-swslug\\'))" class="spring-btn px-3 py-1.5 rounded-lg text-xs font-medium" style="background: var(--accent); color: var(--accent-fg);">Inspect</button>'
           + '  <a href="/api/software/export?name=' + encodeURIComponent(item.slug) + '" class="spring-btn px-3 py-1.5 rounded-lg text-xs font-mono" style="background: var(--bg-subtle); border: 1px solid var(--border);">ZIP</a>'
           + '</div>'
           + '</div>';
@@ -2124,9 +2155,10 @@ function RENDER_DASHBOARD_HTML() {
       if (tab === 'overview') {
         const id = r.identity || {};
         const notes = [...(r.notes || []), ...(r.extraction?.notes || []), ...(r.decompilation?.notes || [])];
+        const verEntries = Object.entries(r.pe?.versionInfo || {});
         body.innerHTML =
           '<div class="rounded-xl p-3 font-mono text-[11px]" style="background: rgba(16,185,129,0.08); border: 1px solid rgba(16,185,129,0.25); color: #10b981;">'
-          + escapeHtml(r.safetyNotice || 'Static analysis only.') + '</div>'
+          + escapeHtml(r.safetyNotice || 'Static analysis only.') + (r.durationMs ? ' (' + r.durationMs + 'ms)' : '') + '</div>'
           + '<div class="grid grid-cols-2 gap-3">'
           + '  <div class="rounded-xl p-3" style="background: var(--bg); border: 1px solid var(--border);"><div style="color: var(--text-dim);">Architecture</div><div class="font-mono font-semibold mt-1">' + escapeHtml(id.architecture || 'N/A') + '</div></div>'
           + '  <div class="rounded-xl p-3" style="background: var(--bg); border: 1px solid var(--border);"><div style="color: var(--text-dim);">Runtime / Framework</div><div class="font-mono font-semibold mt-1">' + escapeHtml(id.runtime || 'N/A') + '</div></div>'
@@ -2135,20 +2167,24 @@ function RENDER_DASHBOARD_HTML() {
           + '  <div class="rounded-xl p-3" style="background: var(--bg); border: 1px solid var(--border);"><div style="color: var(--text-dim);">Extraction</div><div class="font-mono font-semibold mt-1">' + escapeHtml(r.extraction?.status) + ' (' + (r.extraction?.files?.length || 0) + ' files)</div></div>'
           + '  <div class="rounded-xl p-3" style="background: var(--bg); border: 1px solid var(--border);"><div style="color: var(--text-dim);">Decompilation</div><div class="font-mono font-semibold mt-1">' + escapeHtml(r.decompilation?.status) + ' (' + (r.decompilation?.files?.length || 0) + ' files)</div></div>'
           + '</div>'
+          + (verEntries.length ? '<div class="rounded-xl p-3 space-y-1 font-mono text-[11px]" style="background: var(--bg); border: 1px solid var(--border);"><div class="font-semibold">Version Metadata</div>' + verEntries.map(([k, v]) => '<div><span style="color: var(--text-dim);">' + escapeHtml(k) + ':</span> <span style="color: var(--text-muted);">' + escapeHtml(v) + '</span></div>').join('') + '</div>' : '')
+          + (r.pe?.hasAuthenticode ? '<div class="rounded-xl p-3 space-y-1 font-mono text-[11px]" style="background: var(--bg); border: 1px solid var(--border);"><div class="font-semibold">Authenticode Signature (' + r.pe.authenticodeSize + ' bytes)</div><div style="color: var(--text-muted);">' + escapeHtml((r.pe.certificateInfo || []).join(' | ') || 'Signature table present') + '</div></div>' : '')
           + (notes.length ? '<div class="rounded-xl p-3 space-y-1 font-mono text-[11px]" style="background: var(--bg); border: 1px solid var(--border);"><div class="font-semibold" style="color: var(--text);">Notes &amp; Limitations</div>' + notes.map(n => '<div style="color: var(--text-muted);">• ' + escapeHtml(n) + '</div>').join('') + '</div>' : '');
       } else if (tab === 'structure') {
         if (r.pe?.isPE) {
-          const secs = (r.pe.sections || []).map(s => '<tr><td class="py-1 pr-3 font-mono">' + escapeHtml(s.name) + '</td><td class="py-1 pr-3 font-mono">0x' + s.virtualAddress.toString(16) + '</td><td class="py-1 pr-3 font-mono">' + s.rawSize + '</td><td class="py-1 font-mono">' + s.entropy + '</td></tr>').join('');
+          const secs = (r.pe.sections || []).map(s => '<tr><td class="py-1 pr-3 font-mono">' + escapeHtml(s.name) + '</td><td class="py-1 pr-3 font-mono">0x' + s.virtualAddress.toString(16) + '</td><td class="py-1 pr-3 font-mono">' + s.rawSize + '</td><td class="py-1 pr-3 font-mono">' + s.entropy + '</td><td class="py-1 font-mono">' + escapeHtml((s.flags || []).join(',')) + '</td></tr>').join('');
           const deps = (r.pe.dependencies || []).map(d => '<span class="px-2 py-0.5 rounded font-mono text-[11px]" style="background: var(--bg-subtle); border: 1px solid var(--border);">' + escapeHtml(d) + '</span>').join('');
+          const rsrc = (r.pe.resources || []).map(x => '<span class="px-2 py-0.5 rounded font-mono text-[11px]" style="background: var(--bg-subtle); border: 1px solid var(--border);">' + escapeHtml(x) + '</span>').join('');
           body.innerHTML =
             '<div class="rounded-xl p-4 space-y-2" style="background: var(--bg); border: 1px solid var(--border);">'
             + '<div class="font-semibold">PE Sections</div>'
-            + '<table class="w-full text-left text-[11px]"><thead><tr style="color: var(--text-dim);"><th>Name</th><th>VAddr</th><th>Raw Size</th><th>Entropy</th></tr></thead><tbody>' + secs + '</tbody></table>'
+            + '<table class="w-full text-left text-[11px]"><thead><tr style="color: var(--text-dim);"><th>Name</th><th>VAddr</th><th>Raw Size</th><th>Entropy</th><th>Flags</th></tr></thead><tbody>' + secs + '</tbody></table>'
             + '</div>'
             + '<div class="rounded-xl p-4 space-y-2" style="background: var(--bg); border: 1px solid var(--border);">'
             + '<div class="font-semibold">DLL Dependencies (' + (r.pe.dependencies?.length || 0) + ')</div>'
             + '<div class="flex flex-wrap gap-1.5">' + (deps || '<span style="color: var(--text-dim);">None</span>') + '</div>'
-            + '</div>';
+            + '</div>'
+            + (rsrc ? '<div class="rounded-xl p-4 space-y-2" style="background: var(--bg); border: 1px solid var(--border);"><div class="font-semibold">Resources</div><div class="flex flex-wrap gap-1.5">' + rsrc + '</div></div>' : '');
         } else if (r.msi?.isMsi) {
           const tblNames = (r.msi.ole2?.tablesDetected || []).join(', ');
           const cabs = (r.msi.ole2?.embeddedCabs || []).length + ' embedded, ' + (r.msi.ole2?.externalCabs || []).length + ' external';
@@ -2158,7 +2194,9 @@ function RENDER_DASHBOARD_HTML() {
             + '<div class="font-mono text-[11px]" style="color: var(--text-muted);">CABs: ' + escapeHtml(cabs) + '</div>'
             + '<div class="font-mono text-[11px]" style="color: var(--text-muted);">Tables: ' + escapeHtml(tblNames || 'None') + '</div>'
             + '</div>'
-            + (r.msi.fileMappings?.length ? '<div class="rounded-xl p-4 space-y-1" style="background: var(--bg); border: 1px solid var(--border);"><div class="font-semibold">File Mappings (' + r.msi.fileMappings.length + ')</div>' + r.msi.fileMappings.slice(0, 100).map(f => '<div class="font-mono text-[11px]" style="color: var(--text-muted);">' + escapeHtml(f.targetPath) + '</div>').join('') + '</div>' : '');
+            + (r.msi.fileMappings?.length ? '<div class="rounded-xl p-4 space-y-1" style="background: var(--bg); border: 1px solid var(--border);"><div class="font-semibold">File Mappings (' + r.msi.fileMappings.length + ')</div>' + r.msi.fileMappings.slice(0, 100).map(f => '<div class="font-mono text-[11px]" style="color: var(--text-muted);">' + escapeHtml(f.targetPath) + '</div>').join('') + '</div>' : '')
+            + (r.msi.customActions?.length ? '<div class="rounded-xl p-4 space-y-1" style="background: var(--bg); border: 1px solid var(--border);"><div class="font-semibold">Custom Actions (Static Only - ' + r.msi.customActions.length + ')</div>' + r.msi.customActions.slice(0, 50).map(a => '<div class="font-mono text-[11px]" style="color: var(--text-muted);">' + escapeHtml(a.action + ' (Type ' + a.type + '): ' + (a.source || '') + ' -> ' + (a.target || '')) + '</div>').join('') + '</div>' : '')
+            + (r.msi.registryChanges?.length ? '<div class="rounded-xl p-4 space-y-1" style="background: var(--bg); border: 1px solid var(--border);"><div class="font-semibold">Registry Changes (' + r.msi.registryChanges.length + ')</div>' + r.msi.registryChanges.slice(0, 50).map(reg => '<div class="font-mono text-[11px]" style="color: var(--text-muted);">' + escapeHtml((reg.key || '') + '\\\\' + (reg.name || '') + ' = ' + (reg.value || '')) + '</div>').join('') + '</div>' : '');
         } else {
           body.innerHTML = '<div style="color: var(--text-dim);">No PE or MSI structural metadata available.</div>';
         }
@@ -2169,10 +2207,13 @@ function RENDER_DASHBOARD_HTML() {
       } else if (tab === 'files' || tab === 'code') {
         const isCode = tab === 'code';
         const basePrefix = isCode ? '' : (r.identity?.kind === 'msi' ? 'extracted/msi/' : r.identity?.kind === 'pyinstaller' ? 'extracted/pyinstaller/' : r.identity?.packers?.includes('UPX') ? 'extracted/unpacked/' : 'extracted/payload/');
-        const list = isCode ? (r.decompilation?.files || []).map(f => f.output) : (r.extraction?.files || []).map(f => basePrefix + f);
+        const rawList = isCode ? (r.decompilation?.files || []).map(f => f.output) : (r.extraction?.files || []).map(f => basePrefix + f);
+        const q = (swState.inspector.fileFilter || '').toLowerCase();
+        const list = q ? rawList.filter(p => p.toLowerCase().includes(q)) : rawList;
         body.innerHTML =
           '<div class="space-y-2">'
-          + (list.length ? '<div class="rounded-xl p-3 max-h-56 overflow-y-auto space-y-1" style="background: var(--bg); border: 1px solid var(--border);">' + list.slice(0, 200).map(p => '<button onclick="previewSwFile(\\'' + escapeHtml(p) + '\\')" class="block w-full text-left font-mono text-[11px] px-2 py-1 rounded hover:opacity-80" style="color: var(--accent);">' + escapeHtml(p) + '</button>').join('') + '</div>' : '<div class="rounded-xl p-4" style="background: var(--bg); border: 1px solid var(--border); color: var(--text-dim);">No files available for this stage.</div>')
+          + (rawList.length ? '<input id="swFileFilterInput" type="search" value="' + escapeHtml(swState.inspector.fileFilter || '') + '" oninput="swState.inspector.fileFilter=this.value; renderSwTab();" placeholder="Filter files..." class="w-full px-3 py-1.5 rounded-lg text-xs font-mono" />' : '')
+          + (list.length ? '<div class="rounded-xl p-3 max-h-56 overflow-y-auto space-y-1" style="background: var(--bg); border: 1px solid var(--border);">' + list.slice(0, 200).map(p => '<button data-swpath="' + escapeHtml(p) + '" onclick="previewSwFile(this.getAttribute(\\'data-swpath\\'))" class="block w-full text-left font-mono text-[11px] px-2 py-1 rounded hover:opacity-80" style="color: var(--accent);">' + escapeHtml(p) + '</button>').join('') + '</div>' : '<div class="rounded-xl p-4" style="background: var(--bg); border: 1px solid var(--border); color: var(--text-dim);">No files available for this stage.</div>')
           + (swState.inspector.previewPath ? '<div class="rounded-xl p-3 space-y-2" style="background: var(--bg); border: 1px solid var(--border);"><div class="font-mono text-[11px] font-semibold">' + escapeHtml(swState.inspector.previewPath) + '</div><pre class="font-mono text-[11px] overflow-x-auto max-h-96 whitespace-pre-wrap" style="color: var(--text-muted);">' + escapeHtml(swState.inspector.previewContent || '') + '</pre></div>' : '')
           + '</div>';
       }

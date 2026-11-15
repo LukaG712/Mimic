@@ -19,12 +19,22 @@ import { decompileDotNet } from '../engines/dotnet_decompiler.mjs';
 import { decompileNative } from '../engines/native_decompiler.mjs';
 
 export async function analyzeSoftware(filePath, outDir, options = {}) {
+  const startedAt = Date.now();
   const onProgress = typeof options.onProgress === 'function' ? options.onProgress : () => {};
   const extractEnabled = options.extract !== false;
   const decompileEnabled = options.decompile !== false;
+  const maxFileSizeBytes = options.maxFileSizeBytes || 100 * 1024 * 1024;
 
   if (!fs.existsSync(filePath)) {
-    throw new Error(`Input file not found: ${filePath}`);
+    throw new Error(`Input file not found: ${path.basename(filePath)}`);
+  }
+
+  const stats = fs.statSync(filePath);
+  if (!stats.isFile()) {
+    throw new Error('Target path must be a regular file');
+  }
+  if (stats.size > maxFileSizeBytes) {
+    throw new Error(`File exceeds maximum allowed size (${maxFileSizeBytes} bytes)`);
   }
 
   fs.mkdirSync(outDir, { recursive: true });
@@ -32,7 +42,6 @@ export async function analyzeSoftware(filePath, outDir, options = {}) {
 
   const buf = fs.readFileSync(filePath);
   const sha256 = crypto.createHash('sha256').update(buf).digest('hex');
-  const stats = fs.statSync(filePath);
 
   onProgress({ phase: 'tools', message: 'Discovering reverse-engineering tools...' });
   const tools = options.tools || discoverTools();
@@ -46,10 +55,11 @@ export async function analyzeSoftware(filePath, outDir, options = {}) {
   const report = {
     schemaVersion: '1.0',
     analyzedAt: new Date().toISOString(),
+    durationMs: 0,
     safetyNotice: 'Static analysis & isolated extraction only. Target binary and installer custom actions were NOT executed.',
     file: {
       name: path.basename(filePath),
-      sourcePath: path.resolve(filePath),
+      ...(options.includeSourcePath ? { sourcePath: path.resolve(filePath) } : {}),
       size: stats.size,
       sha256
     },
@@ -215,9 +225,10 @@ export async function analyzeSoftware(filePath, outDir, options = {}) {
     report.overallStatus = 'failed';
   }
 
+  report.durationMs = Date.now() - startedAt;
   const reportPath = path.join(outDir, 'analysis-report.json');
   fs.writeFileSync(reportPath, JSON.stringify(report, null, 2), 'utf8');
-  onProgress({ phase: 'done', message: `Analysis complete (${report.overallStatus}).` });
+  onProgress({ phase: 'done', message: `Analysis complete (${report.overallStatus}) in ${report.durationMs}ms.` });
 
   return { outDir, reportPath, report };
 }

@@ -93,40 +93,96 @@ const TOOL_SPECS = [
   {
     id: 'python3',
     name: 'Python 3',
-    bins: ['python3', 'python'],
+    bins: [process.env.MIMIC_PYTHON, 'python3', 'python'].filter(Boolean),
     versionArgs: ['--version'],
     purpose: 'Run bytecode inspection (marshal/dis) and helper scripts'
-  }
+  },
+  ...(process.platform === 'win32' ? [{
+    id: 'powershell',
+    name: 'Windows PowerShell',
+    bins: ['powershell.exe'],
+    versionArgs: ['-NoProfile', '-Command', '$PSVersionTable.PSVersion.ToString()'],
+    purpose: 'Read-only Windows Installer COM database inspection'
+  }] : [])
 ];
 
-function resolveBinary(candidates) {
+function quoteWinCmdArg(arg) {
+  const s = String(arg);
+  if (s === '') return '""';
+  if (!/[\s"&|<>^()%!]/.test(s)) return s;
+  return '"' + s.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/, '$1$1') + '"';
+}
+
+function buildSpawnSpec(binPath, args) {
+  if (process.platform === 'win32' && /\.(bat|cmd)$/i.test(binPath)) {
+    const cmdLine = [quoteWinCmdArg(binPath), ...args.map(quoteWinCmdArg)].join(' ');
+    return {
+      cmd: process.env.ComSpec || 'cmd.exe',
+      args: ['/d', '/s', '/c', `"${cmdLine}"`],
+      windowsVerbatimArguments: true
+    };
+  }
+  return { cmd: binPath, args, windowsVerbatimArguments: false };
+}
+
+function isUsableBinary(filePath) {
+  try {
+    const st = fs.statSync(filePath);
+    // Windows Store python3.exe app execution aliases are 0-byte reparse points
+    if (!st.isFile() || st.size === 0) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function resolveBinary(candidates, requirePython3 = false) {
   for (const cand of candidates) {
     if (!cand) continue;
+    let resolved = null;
     if (cand.includes('/') || cand.includes('\\')) {
-      if (fs.existsSync(cand)) return cand;
-      continue;
+      if (isUsableBinary(cand)) resolved = cand;
+    } else {
+      try {
+        const cmd = process.platform === 'win32' ? 'where' : 'which';
+        const out = execFileSync(cmd, [cand], {
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'ignore'],
+          timeout: 2000
+        }).trim();
+        for (const line of out.split(/\r?\n/)) {
+          const trimmed = line.trim();
+          if (trimmed && isUsableBinary(trimmed)) {
+            resolved = trimmed;
+            break;
+          }
+        }
+      } catch {}
     }
-    try {
-      const cmd = process.platform === 'win32' ? 'where' : 'which';
-      const out = execFileSync(cmd, [cand], {
-        encoding: 'utf8',
-        stdio: ['ignore', 'pipe', 'ignore'],
-        timeout: 2000
-      }).trim();
-      const firstLine = out.split(/\r?\n/)[0]?.trim();
-      if (firstLine && fs.existsSync(firstLine)) return firstLine;
-    } catch {}
+
+    if (!resolved) continue;
+    if (requirePython3) {
+      const ver = probeVersion(resolved, ['--version']);
+      if (!ver || !/Python\s+3\./i.test(ver)) continue;
+    }
+    return resolved;
   }
   return null;
+}
+
+export function resolvePythonExecutable() {
+  return resolveBinary([process.env.MIMIC_PYTHON, 'python3', 'python'].filter(Boolean), true);
 }
 
 function probeVersion(binPath, args) {
   if (!args || args.length === 0) return 'detected';
   try {
-    const out = execFileSync(binPath, args, {
+    const spec = buildSpawnSpec(binPath, args);
+    const out = execFileSync(spec.cmd, spec.args, {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
-      timeout: 3000
+      timeout: 3000,
+      windowsVerbatimArguments: spec.windowsVerbatimArguments
     }).trim();
     const first = out.split(/\r?\n/).find(l => l.trim().length > 0) || 'detected';
     return first.slice(0, 100);
@@ -140,7 +196,7 @@ function probeVersion(binPath, args) {
 export function discoverTools() {
   const tools = {};
   for (const spec of TOOL_SPECS) {
-    const resolved = resolveBinary(spec.bins);
+    const resolved = resolveBinary(spec.bins, spec.id === 'python3');
     tools[spec.id] = {
       id: spec.id,
       name: spec.name,
@@ -159,11 +215,16 @@ export function discoverTools() {
 export function runToolSafe(binPath, args, options = {}) {
   const timeoutMs = options.timeoutMs || 45000;
   const cwd = options.cwd || process.cwd();
+  const env = options.env || process.env;
+  const spec = buildSpawnSpec(binPath, args);
+
   return new Promise((resolve, reject) => {
-    const child = spawn(binPath, args, {
+    const child = spawn(spec.cmd, spec.args, {
       cwd,
+      env,
       stdio: ['ignore', 'pipe', 'pipe'],
-      windowsHide: true
+      windowsHide: true,
+      windowsVerbatimArguments: spec.windowsVerbatimArguments
     });
     let stdout = '';
     let stderr = '';

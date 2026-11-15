@@ -126,6 +126,27 @@ Mimic includes a modular static analysis, safe extraction, and decompilation sub
   - **PyInstaller:** Built-in CArchive extractor + `uncompyle6`/`decompyle3` or Python stdlib `marshal`/`dis` disassembly.
 - **Safety & Honesty:** Target binaries and MSI custom actions are never executed. All extractions enforce strict path-traversal validation (`isSafeSubpath`) and subprocess timeouts, and reports distinguish `decompiled`, `extracted`, `partial`, `unsupported`, and `failed`.
 
+### Optional Reverse-Engineering Tools & Platform Setup
+
+Mimic starts and performs PE/MSI/PyInstaller static inspection with **zero** optional tools installed. Installing optional tools unlocks deeper extraction and decompilation:
+
+| Tool | Purpose | Linux (Debian/Ubuntu) | Windows 11 |
+| :--- | :--- | :--- | :--- |
+| `7z` / `7za` | Extract NSIS, Burn, CAB, SFX, ZIP | `sudo apt install p7zip-full` | `winget install 7zip.7zip` |
+| `ilspycmd` | Decompile `.NET` assemblies to C# | `dotnet tool install -g ilspycmd` | `dotnet tool install -g ilspycmd` |
+| `analyzeHeadless` | Ghidra native C pseudocode decompilation | Install Ghidra & set `GHIDRA_HOME` | Install Ghidra & set `GHIDRA_HOME` |
+| `objdump` | Intel-syntax native PE disassembly | `sudo apt install binutils` | MSYS2 / MinGW `binutils` |
+| `innoextract` | Extract Inno Setup `.exe` installers | `sudo apt install innoextract` | `winget install dsquier.innoextract` |
+| `upx` | Unpack UPX-packed executables | `sudo apt install upx-ucl` | `winget install UPX.UPX` |
+| `msiinfo` / `msiextract` | Inspect & extract `.msi` databases | `sudo apt install msitools` | Built-in read-only COM fallback + `lessmsi` |
+| `uncompyle6` / `decompyle3` | Decompile `.pyc` bytecode to `.py` | `pip install decompyle3 uncompyle6` | `pip install decompyle3 uncompyle6` (stdlib `dis` fallback built-in) |
+
+### Security Boundaries
+
+- Static analysis and archive extraction run in-process or via timeout-bounded child processes (`runToolSafe`); they are **not** OS-level sandboxes.
+- Never run Mimic against untrusted malware on a production host without OS/container/VM isolation.
+- Uploaded binaries, extracted scripts, and MSI `CustomAction` entries are never automatically executed.
+
 ## Repository layout
 
 ```text

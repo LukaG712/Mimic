@@ -127,6 +127,12 @@ export function analyzePE(buf) {
       ? calcEntropy(buf.subarray(rawPointer, sliceEnd))
       : 0;
 
+    const flagNames = [];
+    if (secChars & 0x00000020) flagNames.push('CODE');
+    if (secChars & 0x20000000) flagNames.push('EXECUTE');
+    if (secChars & 0x40000000) flagNames.push('READ');
+    if (secChars & 0x80000000) flagNames.push('WRITE');
+
     sections.push({
       name,
       virtualAddress,
@@ -134,6 +140,7 @@ export function analyzePE(buf) {
       rawPointer,
       rawSize,
       characteristics: secChars,
+      flags: flagNames,
       entropy
     });
   }
@@ -219,6 +226,61 @@ export function analyzePE(buf) {
     }
   }
 
+  // Parse Resource Directory (DataDirectory[2]) types summary
+  const RESOURCE_TYPE_NAMES = {
+    1: 'RT_CURSOR', 2: 'RT_BITMAP', 3: 'RT_ICON', 4: 'RT_MENU', 5: 'RT_DIALOG',
+    6: 'RT_STRING', 9: 'RT_ACCELERATOR', 10: 'RT_RCDATA', 11: 'RT_MESSAGETABLE',
+    12: 'RT_GROUP_CURSOR', 14: 'RT_GROUP_ICON', 16: 'RT_VERSION', 24: 'RT_MANIFEST'
+  };
+  const resources = [];
+  const rsrcDir = dataDirectories[2];
+  if (rsrcDir && rsrcDir.rva > 0) {
+    const rsrcOff = rvaToOffset(rsrcDir.rva, sections);
+    if (rsrcOff >= 0 && rsrcOff + 16 <= buf.length) {
+      const numNamed = buf.readUInt16LE(rsrcOff + 12);
+      const numId = buf.readUInt16LE(rsrcOff + 14);
+      const totalEntries = Math.min(numNamed + numId, 64);
+      for (let i = 0; i < totalEntries; i++) {
+        const eOff = rsrcOff + 16 + i * 8;
+        if (eOff + 8 > buf.length) break;
+        const idOrName = buf.readUInt32LE(eOff);
+        if (idOrName & 0x80000000) {
+          resources.push('NamedResource');
+        } else {
+          resources.push(RESOURCE_TYPE_NAMES[idOrName] || `Type(${idOrName})`);
+        }
+      }
+    }
+  }
+
+  // Parse VS_VERSION_INFO UTF-16LE StringTable metadata
+  const versionInfo = {};
+  const vsMarker = Buffer.from('VS_VERSION_INFO', 'utf16le');
+  const vsPos = buf.indexOf(vsMarker);
+  if (vsPos >= 0) {
+    const vsSlice = buf.subarray(vsPos, Math.min(buf.length, vsPos + 4096));
+    const keys = ['CompanyName', 'FileDescription', 'FileVersion', 'InternalName', 'OriginalFilename', 'ProductName', 'ProductVersion', 'LegalCopyright'];
+    for (const key of keys) {
+      const kBuf = Buffer.from(key + '\0', 'utf16le');
+      const kIdx = vsSlice.indexOf(kBuf);
+      if (kIdx >= 0) {
+        let vStart = kIdx + kBuf.length;
+        // Align to 4-byte boundary relative to slice/buffer if needed (skip null padding)
+        while (vStart + 1 < vsSlice.length && vsSlice[vStart] === 0 && vsSlice[vStart + 1] === 0) {
+          vStart += 2;
+        }
+        let vEnd = vStart;
+        while (vEnd + 1 < Math.min(vsSlice.length, vStart + 512) && !(vsSlice[vEnd] === 0 && vsSlice[vEnd + 1] === 0)) {
+          vEnd += 2;
+        }
+        const val = vsSlice.subarray(vStart, vEnd).toString('utf16le').trim();
+        if (val && /^[\x20-\x7e\u00a0-\uffff]{1,200}$/.test(val)) {
+          versionInfo[key] = val;
+        }
+      }
+    }
+  }
+
   // Parse Debug Directory (DataDirectory[6]) for CodeView PDB path
   const pdbPaths = [];
   const dbgDir = dataDirectories[6];
@@ -250,6 +312,16 @@ export function analyzePE(buf) {
   // Security / Authenticode Certificate Table (DataDirectory[4] uses raw file offset!)
   const secDir = dataDirectories[4];
   const hasAuthenticode = Boolean(secDir && secDir.rva > 0 && secDir.size > 0);
+  const certificateInfo = [];
+  if (hasAuthenticode && secDir.rva + 8 < buf.length) {
+    const certEnd = Math.min(buf.length, secDir.rva + secDir.size);
+    const certSlice = buf.subarray(secDir.rva + 8, certEnd);
+    const asciiMatches = certSlice.toString('latin1').match(/[A-Za-z0-9][A-Za-z0-9 .,_&()-]{3,80}/g) || [];
+    const interesting = asciiMatches.filter(s =>
+      /(?:Inc\.|LLC|Corp\.|Corporation|Ltd\.|DigiCert|Sectigo|GlobalSign|VeriSign|Microsoft|Entrust|thawte|CA|Authority|Code Signing)/i.test(s)
+    );
+    certificateInfo.push(...[...new Set(interesting)].slice(0, 12));
+  }
 
   // Check for embedded XML application manifest
   let embeddedManifest = null;
@@ -276,6 +348,9 @@ export function analyzePE(buf) {
     hasClrHeader,
     hasAuthenticode,
     authenticodeSize: hasAuthenticode ? secDir.size : 0,
+    certificateInfo,
+    versionInfo,
+    resources: [...new Set(resources)],
     sections,
     imports,
     dependencies: imports.map(i => i.dll),

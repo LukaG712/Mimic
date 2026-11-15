@@ -11,7 +11,7 @@ import { fileURLToPath } from 'url';
 import { runReaAppAnalysis } from './engine/rea_bridge.mjs';
 import { unpackDesktopApp } from './engine/desktop_unpacker.mjs';
 import { analyzeSoftware } from './reverse/orchestrator/analysis_pipeline.mjs';
-import { discoverTools } from './reverse/orchestrator/tool_registry.mjs';
+import { discoverTools, resolvePythonExecutable } from './reverse/orchestrator/tool_registry.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -374,13 +374,18 @@ app.on('window-all-closed', () => {
           console.log(`  Run inside ${targetDir}: npm install && npm run build:win`);
         }
       } else {
+        const pyBin = resolvePythonExecutable();
+        if (!pyBin) {
+          console.error('❌ Error: Python 3 executable not found for zip export. Set MIMIC_PYTHON or install Python 3.');
+          process.exit(1);
+        }
         const outZip = options.out ? path.resolve(options.out) : path.join(CLONES_DIR, `${slug}.zip`);
-        const pyZip = spawn('python3', [
+        const pyZip = spawn(pyBin, [
           '-c',
           'import shutil, sys; shutil.make_archive(sys.argv[1][:-4], "zip", sys.argv[2])',
           outZip,
           targetDir
-        ], { stdio: 'inherit' });
+        ], { stdio: 'inherit', windowsHide: true });
         pyZip.on('close', (code) => {
           if (code !== 0) process.exit(code);
           if (options.json) {

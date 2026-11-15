@@ -10,10 +10,10 @@ import path from 'path';
 import { runToolSafe } from '../orchestrator/tool_registry.mjs';
 
 const GHIDRA_EXPORT_SCRIPT = `
-# Ghidra headless postScript to export decompiled C pseudocode
+# Ghidra headless postScript to export decompiled C pseudocode and function metadata
 from ghidra.app.decompiler import DecompInterface
 from ghidra.util.task import ConsoleTaskMonitor
-import os
+import os, json
 
 out_dir = os.environ.get("MIMIC_GHIDRA_OUT", ".")
 decomp = DecompInterface()
@@ -21,17 +21,29 @@ decomp.openProgram(currentProgram)
 fm = currentProgram.getFunctionManager()
 funcs = fm.getFunctions(True)
 out_path = os.path.join(out_dir, "decompiled_functions.c")
+meta_path = os.path.join(out_dir, "functions.json")
+func_meta = []
+monitor = ConsoleTaskMonitor()
 with open(out_path, "w") as f:
     f.write("// Decompiled by Ghidra Headless for Mimic\\n\\n")
     count = 0
     for func in funcs:
         if count >= 200:
             break
-        res = decomp.decompileFunction(func, 30, ConsoleTaskMonitor())
+        func_meta.append({
+            "name": func.getName(),
+            "entryPoint": str(func.getEntryPoint()),
+            "bodySize": int(func.getBody().getNumAddresses()),
+            "calledCount": len(func.getCalledFunctions(monitor)),
+            "callingCount": len(func.getCallingFunctions(monitor))
+        })
+        res = decomp.decompileFunction(func, 30, monitor)
         if res and res.decompileCompleted():
             f.write(res.getDecompiledFunction().getC())
             f.write("\\n")
             count += 1
+with open(meta_path, "w") as mf:
+    json.dump(func_meta, mf, indent=2)
 `;
 
 export async function decompileNative(filePath, outDir, tools = {}) {
@@ -49,28 +61,39 @@ export async function decompileNative(filePath, outDir, tools = {}) {
     fs.writeFileSync(scriptPath, GHIDRA_EXPORT_SCRIPT, 'utf8');
 
     try {
-      process.env.MIMIC_GHIDRA_OUT = nativeDir;
       const res = await runToolSafe(
         tools.ghidra.path,
         [projDir, 'MimicProj', '-import', filePath, '-scriptPath', scriptDir, '-postScript', 'MimicExportC.py', '-deleteProject'],
-        { timeoutMs: 120000 }
+        { timeoutMs: 120000, env: { ...process.env, MIMIC_GHIDRA_OUT: nativeDir } }
       );
       const cFile = path.join(nativeDir, 'decompiled_functions.c');
+      const metaFile = path.join(nativeDir, 'functions.json');
       if (fs.existsSync(cFile) && fs.statSync(cFile).size > 0) {
+        const files = [{
+          output: path.relative(outDir, cFile).replace(/\\/g, '/'),
+          mode: 'decompiled',
+          tool: 'ghidra'
+        }];
+        if (fs.existsSync(metaFile)) {
+          files.push({
+            output: path.relative(outDir, metaFile).replace(/\\/g, '/'),
+            mode: 'metadata',
+            tool: 'ghidra'
+          });
+        }
         return {
           status: 'decompiled',
           toolUsed: 'ghidra',
-          files: [{
-            output: path.relative(outDir, cFile).replace(/\\/g, '/'),
-            mode: 'decompiled',
-            tool: 'ghidra'
-          }],
+          files,
           notes: []
         };
       }
       notes.push(`Ghidra exited ${res.code} without producing C output.`);
     } catch (err) {
       notes.push(`Ghidra error: ${err.message}`);
+    } finally {
+      try { fs.rmSync(projDir, { recursive: true, force: true }); } catch {}
+      try { fs.rmSync(scriptDir, { recursive: true, force: true }); } catch {}
     }
   } else {
     notes.push('Ghidra (analyzeHeadless) is not installed; C pseudocode decompilation unavailable.');

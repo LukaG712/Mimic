@@ -78,6 +78,12 @@ export function identifyBinary(filePath, existingBuffer = null) {
   if (sectionNames.has('.ASPACK') || sectionNames.has('.ADATA')) packers.push('ASPack');
   if (sectionNames.has('.THEMIDA') || hasMarker(buf, 'Themida')) packers.push('Themida');
   if (sectionNames.has('.VMP0') || sectionNames.has('.VMP1')) packers.push('VMProtect');
+  if (sectionNames.has('.MPRESS1') || sectionNames.has('.MPRESS2')) packers.push('MPRESS');
+  if (sectionNames.has('PEC2') || hasMarker(buf, 'PEC2')) packers.push('PECompact');
+  if (sectionNames.has('.ENIGMA1') || sectionNames.has('.ENIGMA2')) packers.push('Enigma Protector');
+  if (hasMarker(buf, '__pyarmor__')) packers.push('PyArmor');
+  if (hasMarker(buf, 'ConfuserEx')) packers.push('ConfuserEx');
+  if (hasMarker(buf, 'costura.')) packers.push('Costura.Fody');
   if (pe.sections.some(s => s.entropy >= 7.4 && s.rawSize > 4096) && packers.length === 0) {
     packers.push('High-Entropy Section (Possible Packer/Encrypted Payload)');
   }

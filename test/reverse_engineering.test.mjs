@@ -5,7 +5,7 @@ import path from 'path';
 import zlib from 'zlib';
 import { execFileSync } from 'child_process';
 
-import { isSafeSubpath, discoverTools } from '../src/reverse/orchestrator/tool_registry.mjs';
+import { isSafeSubpath, discoverTools, resolvePythonExecutable } from '../src/reverse/orchestrator/tool_registry.mjs';
 import { analyzePE } from '../src/reverse/engines/pe_analyzer.mjs';
 import { identifyBinary } from '../src/reverse/detection/file_identifier.mjs';
 import { analyzeStrings } from '../src/reverse/analysis/strings_analyzer.mjs';
@@ -241,9 +241,28 @@ async function runTests() {
     const nsisPe = buildSyntheticPE({ extraTail: Buffer.from('NullsoftInst') });
     assert.strictEqual(identifyBinary('nsis.exe', nsisPe).installerFramework, 'NSIS (Nullsoft Scriptable Install System)');
 
+    const burnPe = buildSyntheticPE({ extraTail: Buffer.from('WixBurn') });
+    assert.strictEqual(identifyBinary('burn.exe', burnPe).installerFramework, 'WiX Burn');
+
+    const mpressPe = buildSyntheticPE({ sections: [{ name: '.MPRESS1', data: Buffer.from('packed') }] });
+    assert.ok(identifyBinary('mpress.exe', mpressPe).packers.includes('MPRESS'));
+
+    // 5b. VS_VERSION_INFO parsing
+    const verPayload = Buffer.concat([
+      Buffer.from('VS_VERSION_INFO\0', 'utf16le'),
+      Buffer.from('ProductName\0\0MimicTestApp\0CompanyName\0\0Antigravity\0FileVersion\x00\x002.4.1.0\0', 'utf16le')
+    ]);
+    const verPe = buildSyntheticPE({ extraTail: verPayload });
+    const verParsed = analyzePE(verPe);
+    assert.strictEqual(verParsed.versionInfo.ProductName, 'MimicTestApp');
+    assert.strictEqual(verParsed.versionInfo.CompanyName, 'Antigravity');
+    assert.strictEqual(verParsed.versionInfo.FileVersion, '2.4.1.0');
+
     // 6. PyInstaller extraction + path traversal blocking + Python bytecode disassembly
+    const pyBin = resolvePythonExecutable();
+    assert.ok(pyBin, 'resolvePythonExecutable() should find Python 3');
     const pycOut = path.join(tmpRoot, 'sample.pyc');
-    execFileSync('python3', [
+    execFileSync(pyBin, [
       '-c',
       'import marshal, sys; code = compile("x = 42\\nprint(x)", "<test>", "exec"); open(sys.argv[1], "wb").write(b"\\x00"*16 + marshal.dumps(code))',
       pycOut
@@ -258,6 +277,8 @@ async function runTests() {
     const pyiAnalysisDir = path.join(tmpRoot, 'out-pyi');
     const pyiReport = await analyzeSoftware(pyiPath, pyiAnalysisDir);
     assert.strictEqual(pyiReport.report.extraction.status, 'extracted');
+    assert.ok(pyiReport.report.durationMs >= 0);
+    assert.strictEqual(pyiReport.report.file.sourcePath, undefined, 'sourcePath should not leak by default');
     assert.ok(pyiReport.report.extraction.files.includes('main.pyc'));
     assert.strictEqual(pyiReport.report.extraction.blockedPaths.length, 1);
     assert.strictEqual(fs.existsSync(path.join(tmpRoot, 'evil.txt')), false, 'Path traversal file must never be written');
@@ -265,6 +286,24 @@ async function runTests() {
       pyiReport.report.decompilation.files.some(f => f.output.endsWith('main.dis.txt') || f.output.endsWith('main.py')),
       'Python bytecode should be disassembled or decompiled'
     );
+
+    // 6b. Real 7z ZIP archive extraction via pipeline
+    if (tools['7z']?.available) {
+      const zipSrcDir = path.join(tmpRoot, 'zip-src');
+      fs.mkdirSync(path.join(zipSrcDir, 'sub'), { recursive: true });
+      fs.writeFileSync(path.join(zipSrcDir, 'sub', 'hello.txt'), 'hello from mimic archive', 'utf8');
+      const zipPath = path.join(tmpRoot, 'bundle.zip');
+      execFileSync(pyBin, [
+        '-c',
+        'import shutil, sys; shutil.make_archive(sys.argv[1][:-4], "zip", sys.argv[2])',
+        zipPath,
+        zipSrcDir
+      ]);
+      const zipOut = path.join(tmpRoot, 'out-zip');
+      const zipRep = await analyzeSoftware(zipPath, zipOut);
+      assert.strictEqual(zipRep.report.extraction.status, 'extracted');
+      assert.ok(zipRep.report.extraction.files.some(f => f.endsWith('hello.txt')));
+    }
 
     // 7. MSI OLE2 container & CAB detection
     const msiBuf = buildSyntheticMsi();

@@ -26,7 +26,9 @@ const KEY_MSI_TABLES = [
   'ServiceControl',
   'LaunchCondition',
   'InstallExecuteSequence',
-  'InstallUISequence'
+  'InstallUISequence',
+  'Environment',
+  'RemoveFile'
 ];
 
 /**
@@ -185,6 +187,111 @@ function buildDirectoryTreeMap(dirRows) {
   return resolved;
 }
 
+function populateMsiSummaries(result, externalCabSet) {
+  if (result.tables.Property) {
+    for (const r of result.tables.Property.rows) {
+      if (r.Property) result.properties[r.Property] = r.Value;
+    }
+  }
+  if (result.tables.Directory) {
+    result.directories = buildDirectoryTreeMap(result.tables.Directory.rows);
+  }
+  if (result.tables.File && result.tables.Component) {
+    const compToDir = new Map();
+    for (const c of result.tables.Component.rows) {
+      compToDir.set(c.Component, c.Directory_);
+    }
+    for (const f of result.tables.File.rows) {
+      const dirId = compToDir.get(f.Component_);
+      const targetDir = result.directories[dirId] || dirId || '';
+      const fileName = (f.FileName || f.File || '').split('|').pop();
+      result.fileMappings.push({
+        id: f.File,
+        fileName,
+        component: f.Component_,
+        targetDir,
+        targetPath: targetDir ? `${targetDir}/${fileName}` : fileName,
+        size: Number(f.FileSize) || 0,
+        version: f.Version || null
+      });
+    }
+  }
+  if (result.tables.Media) {
+    for (const m of result.tables.Media.rows) {
+      if (m.Cabinet && !m.Cabinet.startsWith('#')) {
+        externalCabSet.add(m.Cabinet);
+      }
+    }
+  }
+  if (result.tables.CustomAction) {
+    result.customActions = result.tables.CustomAction.rows.map(r => ({
+      action: r.Action,
+      type: Number(r.Type) || r.Type,
+      source: r.Source,
+      target: r.Target
+    }));
+  }
+  if (result.tables.Registry) {
+    result.registryChanges = result.tables.Registry.rows.map(r => ({
+      root: r.Root,
+      key: r.Key,
+      name: r.Name,
+      value: r.Value
+    }));
+  }
+  if (result.tables.Shortcut) {
+    result.shortcuts = result.tables.Shortcut.rows.map(r => ({
+      name: (r.Name || '').split('|').pop(),
+      directory: result.directories[r.Directory_] || r.Directory_,
+      target: r.Target,
+      description: r.Description
+    }));
+  }
+  if (result.tables.ServiceInstall) {
+    result.services = result.tables.ServiceInstall.rows;
+  }
+  if (result.tables.Environment) {
+    result.environmentChanges = result.tables.Environment.rows;
+  }
+  if (result.tables.RemoveFile) {
+    result.removedFiles = result.tables.RemoveFile.rows;
+  }
+  if (result.tables.LaunchCondition) {
+    result.launchConditions = result.tables.LaunchCondition.rows;
+  }
+}
+
+const WIN_MSI_COM_SCRIPT = `
+$ErrorActionPreference = 'Stop'
+$msiPath = $env:MIMIC_MSI_PATH
+$inst = New-Object -ComObject WindowsInstaller.Installer
+$db = $inst.OpenDatabase($msiPath, 0) # 0 = msiOpenDatabaseModeReadOnly
+$tables = @('Property','File','Component','Feature','Directory','Media','CustomAction','Registry','Shortcut','ServiceInstall','ServiceControl','LaunchCondition','InstallExecuteSequence','InstallUISequence','Environment','RemoveFile')
+$out = @{}
+foreach ($t in $tables) {
+  try {
+    if ($db.TablePersistent($t) -ne 1) { continue }
+    $view = $db.OpenView("SELECT * FROM \`$t\`")
+    $view.Execute()
+    $colInfo = $view.ColumnInfo(0)
+    $cols = @()
+    for ($i = 1; $i -le $colInfo.FieldCount; $i++) { $cols += $colInfo.StringData($i) }
+    $rows = @()
+    while ($true) {
+      $rec = $view.Fetch()
+      if ($null -eq $rec) { break }
+      $obj = [ordered]@{}
+      for ($i = 1; $i -le $cols.Count; $i++) { $obj[$cols[$i-1]] = $rec.StringData($i) }
+      $rows += $obj
+      if ($rows.Count -ge 2000) { break }
+    }
+    $view.Close()
+    $out[$t] = @{ columns = $cols; rows = $rows; totalRows = $rows.Count }
+  } catch {}
+}
+$out | ConvertTo-Json -Depth 6 -Compress
+`;
+
 export async function analyzeMsi(filePath, tools = {}, existingBuffer = null) {
   const buf = existingBuffer || fs.readFileSync(filePath);
   const ole2 = parseOle2Container(buf);
@@ -210,6 +317,9 @@ export async function analyzeMsi(filePath, tools = {}, existingBuffer = null) {
     registryChanges: [],
     shortcuts: [],
     services: [],
+    environmentChanges: [],
+    removedFiles: [],
+    launchConditions: [],
     status: 'partial',
     notes: []
   };
@@ -254,73 +364,32 @@ export async function analyzeMsi(filePath, tools = {}, existingBuffer = null) {
         }
       }
 
-      // Extract structured summaries from parsed tables
-      if (result.tables.Property) {
-        for (const r of result.tables.Property.rows) {
-          if (r.Property) result.properties[r.Property] = r.Value;
-        }
-      }
-      if (result.tables.Directory) {
-        result.directories = buildDirectoryTreeMap(result.tables.Directory.rows);
-      }
-      if (result.tables.File && result.tables.Component) {
-        const compToDir = new Map();
-        for (const c of result.tables.Component.rows) {
-          compToDir.set(c.Component, c.Directory_);
-        }
-        for (const f of result.tables.File.rows) {
-          const dirId = compToDir.get(f.Component_);
-          const targetDir = result.directories[dirId] || dirId || '';
-          const fileName = (f.FileName || f.File || '').split('|').pop();
-          result.fileMappings.push({
-            id: f.File,
-            fileName,
-            component: f.Component_,
-            targetDir,
-            targetPath: targetDir ? `${targetDir}/${fileName}` : fileName,
-            size: Number(f.FileSize) || 0,
-            version: f.Version || null
-          });
-        }
-      }
-      if (result.tables.Media) {
-        for (const m of result.tables.Media.rows) {
-          if (m.Cabinet && !m.Cabinet.startsWith('#')) {
-            externalCabSet.add(m.Cabinet);
-          }
-        }
-      }
-      if (result.tables.CustomAction) {
-        result.customActions = result.tables.CustomAction.rows.map(r => ({
-          action: r.Action,
-          type: Number(r.Type) || r.Type,
-          source: r.Source,
-          target: r.Target
-        }));
-      }
-      if (result.tables.Registry) {
-        result.registryChanges = result.tables.Registry.rows.map(r => ({
-          root: r.Root,
-          key: r.Key,
-          name: r.Name,
-          value: r.Value
-        }));
-      }
-      if (result.tables.Shortcut) {
-        result.shortcuts = result.tables.Shortcut.rows.map(r => ({
-          name: (r.Name || '').split('|').pop(),
-          directory: result.directories[r.Directory_] || r.Directory_,
-          target: r.Target,
-          description: r.Description
-        }));
-      }
-      if (result.tables.ServiceInstall) {
-        result.services = result.tables.ServiceInstall.rows;
-      }
-
+      populateMsiSummaries(result, externalCabSet);
       result.status = 'extracted';
     } catch (err) {
       result.notes.push(`msiinfo inspection error: ${err.message}`);
+    }
+  } else if (process.platform === 'win32' && tools?.powershell?.available && tools.powershell.path) {
+    try {
+      const psRes = await runToolSafe(
+        tools.powershell.path,
+        ['-NoProfile', '-NonInteractive', '-Command', WIN_MSI_COM_SCRIPT],
+        { timeoutMs: 30000, env: { ...process.env, MIMIC_MSI_PATH: path.resolve(filePath) } }
+      );
+      if (psRes.code === 0 && psRes.stdout.trim()) {
+        const parsedTables = JSON.parse(psRes.stdout.trim());
+        result.tables = parsedTables;
+        const tblKeys = Object.keys(parsedTables);
+        if (tblKeys.length > 0) {
+          result.ole2.tablesDetected = tblKeys;
+          populateMsiSummaries(result, externalCabSet);
+          result.status = 'extracted';
+        }
+      } else {
+        result.notes.push(`Windows Installer COM fallback failed: ${psRes.stderr.trim()}`);
+      }
+    } catch (err) {
+      result.notes.push(`Windows Installer COM inspection error: ${err.message}`);
     }
   } else {
     result.notes.push('msiinfo (msitools) is not installed; reporting OLE2 container structure and embedded CAB metadata only.');
