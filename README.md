@@ -1,8 +1,8 @@
 <div align="center">
 
-<img src="docs/banner.svg" alt="Mimic — High-Fidelity Web Capture, Offline Replay & Binary Reverse Engineering" width="100%"/>
+<img src="docs/logo.svg" alt="Mimic" width="76" height="76"/>
 
-<br/><br/>
+<h1>Mimic</h1>
 
 [![CI](https://github.com/LukaG712/Mimic/actions/workflows/ci.yml/badge.svg)](https://github.com/LukaG712/Mimic/actions/workflows/ci.yml)
 [![Node.js](https://img.shields.io/badge/Node.js-18%2B-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
