@@ -8,6 +8,7 @@
 import { spawn } from 'child_process';
 import crypto from 'crypto';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { findChromePath, getChromeLaunchArgs } from './chrome_finder.mjs';
@@ -22,10 +23,14 @@ const COMMAND_TIMEOUT_MS = 15000;
 /**
  * Polls Chrome's remote debugging endpoint until ready instead of sleeping a fixed duration.
  */
-export async function waitForChromeReady(port, maxWaitMs = 5000, isAborted = () => false) {
+export async function waitForChromeReady(port, maxWaitMs = 15000, isAborted = () => false, getExitError = null) {
   const deadline = Date.now() + maxWaitMs;
   let lastErr;
   while (Date.now() < deadline && !isAborted()) {
+    const exitErr = getExitError ? getExitError() : null;
+    if (exitErr) {
+      throw new Error(exitErr);
+    }
     try {
       const resp = await fetch(`http://127.0.0.1:${port}/json/version`);
       if (resp.ok) {
@@ -105,8 +110,26 @@ export async function captureRuntime(targetUrl, outputDir, options = {}) {
 
   const chromePath = findChromePath();
   fs.mkdirSync(outputDir, { recursive: true });
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mimic-chrome-'));
 
-  const chrome = spawn(chromePath, getChromeLaunchArgs(port, { headless: !options.interactiveLogin }));
+  let chromeStderr = '';
+  let chromeExitMessage = null;
+  const chrome = spawn(
+    chromePath,
+    getChromeLaunchArgs(port, { headless: !options.interactiveLogin, userDataDir }),
+    { stdio: ['ignore', 'ignore', 'pipe'] }
+  );
+  chrome.stderr?.on('data', (chunk) => {
+    if (chromeStderr.length < 2048) {
+      chromeStderr += chunk.toString('utf8');
+    }
+  });
+  chrome.on('exit', (code, signal) => {
+    if (!aborted) {
+      const detail = chromeStderr.trim() ? `: ${chromeStderr.trim().slice(0, 500)}` : '';
+      chromeExitMessage = `Chrome exited prematurely (code=${code}, signal=${signal})${detail}`;
+    }
+  });
 
   let ws;
   let overallTimer;
@@ -124,7 +147,7 @@ export async function captureRuntime(targetUrl, outputDir, options = {}) {
     const createdDirs = new Map();
     const mimeBreakdown = {};
 
-    const versionData = await waitForChromeReady(port, 5000, () => aborted);
+    const versionData = await waitForChromeReady(port, 15000, () => aborted, () => chromeExitMessage);
     if (aborted || !versionData) return;
 
     ws = new WebSocket(versionData.webSocketDebuggerUrl);
@@ -768,7 +791,8 @@ export async function captureRuntime(targetUrl, outputDir, options = {}) {
     if (ws) {
       try { ws.close(); } catch {}
     }
-    try { chrome.kill(); } catch {}
+    try { chrome.kill('SIGKILL'); } catch {}
+    try { fs.rmSync(userDataDir, { recursive: true, force: true }); } catch {}
   }
 }
 

@@ -15,5 +15,7 @@ jobs:
         with:
           node-version: '22'
       - uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
       - name: Run Mimic test suite
         run: npm test

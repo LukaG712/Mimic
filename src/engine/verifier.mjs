@@ -6,6 +6,7 @@
 
 import { spawn } from 'child_process';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { waitForChromeReady } from './cdp_capture.mjs';
 import { findChromePath, getChromeLaunchArgs } from './chrome_finder.mjs';
@@ -38,8 +39,26 @@ export async function verifyClone(localUrl, outputDir = '.', options = {}) {
 
   const chromePath = findChromePath();
   fs.mkdirSync(outputDir, { recursive: true });
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mimic-verify-chrome-'));
 
-  const chrome = spawn(chromePath, getChromeLaunchArgs(port));
+  let chromeStderr = '';
+  let chromeExitMessage = null;
+  const chrome = spawn(
+    chromePath,
+    getChromeLaunchArgs(port, { userDataDir }),
+    { stdio: ['ignore', 'ignore', 'pipe'] }
+  );
+  chrome.stderr?.on('data', (chunk) => {
+    if (chromeStderr.length < 2048) {
+      chromeStderr += chunk.toString('utf8');
+    }
+  });
+  chrome.on('exit', (code, signal) => {
+    if (!aborted) {
+      const detail = chromeStderr.trim() ? `: ${chromeStderr.trim().slice(0, 500)}` : '';
+      chromeExitMessage = `Chrome exited prematurely (code=${code}, signal=${signal})${detail}`;
+    }
+  });
 
   let ws;
   let overallTimer;
@@ -52,7 +71,7 @@ export async function verifyClone(localUrl, outputDir = '.', options = {}) {
     const inflightRequests = new Set();
     let lastNetworkActivity = Date.now();
 
-    const versionData = await waitForChromeReady(port, 5000, () => aborted);
+    const versionData = await waitForChromeReady(port, 15000, () => aborted, () => chromeExitMessage);
     if (aborted || !versionData) return;
 
     ws = new WebSocket(versionData.webSocketDebuggerUrl);
@@ -313,7 +332,8 @@ export async function verifyClone(localUrl, outputDir = '.', options = {}) {
     if (ws) {
       try { ws.close(); } catch {}
     }
-    try { chrome.kill(); } catch {}
+    try { chrome.kill('SIGKILL'); } catch {}
+    try { fs.rmSync(userDataDir, { recursive: true, force: true }); } catch {}
   }
 }
 
