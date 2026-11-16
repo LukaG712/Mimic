@@ -62,6 +62,7 @@ export function getChromeLaunchArgs(port, options = {}) {
   const args = [
     ...(headless ? ['--headless=new'] : []),
     `--remote-debugging-port=${port}`,
+    '--remote-debugging-address=127.0.0.1',
     '--no-first-run',
     '--no-default-browser-check',
     '--disable-background-networking',

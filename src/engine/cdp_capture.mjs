@@ -8,6 +8,7 @@
 import { spawn } from 'child_process';
 import crypto from 'crypto';
 import fs from 'fs';
+import net from 'net';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -90,11 +91,24 @@ function parseHeadersOption(headersOpt) {
   return out;
 }
 
+async function getFreePort() {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.unref();
+    srv.on('error', reject);
+    srv.listen(0, '127.0.0.1', () => {
+      const addr = srv.address();
+      const port = typeof addr === 'object' && addr ? addr.port : 9222;
+      srv.close(() => resolve(port));
+    });
+  });
+}
+
 export async function captureRuntime(targetUrl, outputDir, options = {}) {
   const width = options.width || 1440;
   const height = options.height || 900;
   const waitMs = options.waitMs || 3500;
-  const port = options.port || (9222 + Math.floor(Math.random() * 400));
+  const port = options.port || (await getFreePort());
   const doScroll = options.scroll !== false;
   const targetPort = options.targetPort || 3000;
   const timeoutMs = options.timeout || 60000;
@@ -147,7 +161,7 @@ export async function captureRuntime(targetUrl, outputDir, options = {}) {
     const createdDirs = new Map();
     const mimeBreakdown = {};
 
-    const versionData = await waitForChromeReady(port, 15000, () => aborted, () => chromeExitMessage);
+    const versionData = await waitForChromeReady(port, Math.min(30000, timeoutMs), () => aborted, () => chromeExitMessage);
     if (aborted || !versionData) return;
 
     ws = new WebSocket(versionData.webSocketDebuggerUrl);

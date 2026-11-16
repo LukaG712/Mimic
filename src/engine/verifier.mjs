@@ -71,7 +71,7 @@ export async function verifyClone(localUrl, outputDir = '.', options = {}) {
     const inflightRequests = new Set();
     let lastNetworkActivity = Date.now();
 
-    const versionData = await waitForChromeReady(port, 15000, () => aborted, () => chromeExitMessage);
+    const versionData = await waitForChromeReady(port, Math.min(30000, timeoutMs), () => aborted, () => chromeExitMessage);
     if (aborted || !versionData) return;
 
     ws = new WebSocket(versionData.webSocketDebuggerUrl);
