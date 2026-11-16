@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 320" width="1200" height="320" role="img" aria-label="Mimic — High-Fidelity Web Capture &amp; Software Reverse-Engineering Suite">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#090d16"/>
+      <stop offset="55%" stop-color="#0f172a"/>
+      <stop offset="100%" stop-color="#111827"/>
+    </linearGradient>
+    <radialGradient id="glow1" cx="20%" cy="25%" r="55%">
+      <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.22"/>
+      <stop offset="100%" stop-color="#38bdf8" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glow2" cx="82%" cy="75%" r="55%">
+      <stop offset="0%" stop-color="#818cf8" stop-opacity="0.20"/>
+      <stop offset="100%" stop-color="#818cf8" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="accent" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="50%" stop-color="#818cf8"/>
+      <stop offset="100%" stop-color="#c084fc"/>
+    </linearGradient>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#94a3b8" stroke-opacity="0.07" stroke-width="1"/>
+    </pattern>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1200" height="320" rx="18" fill="url(#bg)"/>
+  <rect width="1200" height="320" rx="18" fill="url(#grid)"/>
+  <rect width="1200" height="320" rx="18" fill="url(#glow1)"/>
+  <rect width="1200" height="320" rx="18" fill="url(#glow2)"/>
+  <rect x="1" y="1" width="1198" height="318" rx="17" fill="none" stroke="#334155" stroke-opacity="0.6" stroke-width="1.5"/>
+
+  <!-- Geometric Emblem (Layered Mirrors / Cloning Prism) -->
+  <g transform="translate(110, 92)">
+    <rect x="0" y="24" width="88" height="88" rx="16" fill="#0f172a" stroke="#38bdf8" stroke-opacity="0.45" stroke-width="2"/>
+    <rect x="20" y="12" width="88" height="88" rx="16" fill="#111827" stroke="#818cf8" stroke-opacity="0.7" stroke-width="2"/>
+    <rect x="40" y="0" width="88" height="88" rx="16" fill="#0b1120" stroke="url(#accent)" stroke-width="2.5"/>
+    <path d="M 64 56 L 64 30 L 84 46 L 104 30 L 104 56" fill="none" stroke="url(#accent)" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="84" cy="64" r="3.5" fill="#38bdf8"/>
+  </g>
+
+  <!-- Title & Tagline -->
+  <text x="275" y="142" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="68" font-weight="800" letter-spacing="-1.5" fill="#f8fafc">MIMIC</text>
+  <rect x="278" y="160" width="96" height="4" rx="2" fill="url(#accent)"/>
+  <text x="275" y="198" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="22" font-weight="500" fill="#cbd5e1">High-Fidelity Web Capture, Offline Replay &amp; Binary Reverse Engineering</text>
+
+  <!-- Capability Pills -->
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13" font-weight="600">
+    <rect x="275" y="226" width="142" height="30" rx="15" fill="#0f172a" stroke="#38bdf8" stroke-opacity="0.45"/>
+    <text x="346" y="246" text-anchor="middle" fill="#7dd3fc">CDP Stream</text>
+
+    <rect x="429" y="226" width="150" height="30" rx="15" fill="#0f172a" stroke="#818cf8" stroke-opacity="0.45"/>
+    <text x="504" y="246" text-anchor="middle" fill="#a5b4fc">Offline Proxy</text>
+
+    <rect x="591" y="226" width="150" height="30" rx="15" fill="#0f172a" stroke="#c084fc" stroke-opacity="0.45"/>
+    <text x="666" y="246" text-anchor="middle" fill="#d8b4fe">Electron ASAR</text>
+
+    <rect x="753" y="226" width="174" height="30" rx="15" fill="#0f172a" stroke="#34d399" stroke-opacity="0.45"/>
+    <text x="840" y="246" text-anchor="middle" fill="#6ee7b7">.EXE / .MSI Inspect</text>
+
+    <rect x="939" y="226" width="136" height="30" rx="15" fill="#0f172a" stroke="#f472b6" stroke-opacity="0.45"/>
+    <text x="1007" y="246" text-anchor="middle" fill="#f9a8d4">Visual Diff</text>
+  </g>
+</svg>
