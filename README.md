@@ -1,8 +1,12 @@
 <div align="center">
 
-<img src="docs/logo.svg" alt="Mimic" width="76" height="76"/>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/logo-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="docs/logo-light.svg">
+  <img src="docs/logo-dark.svg" alt="Mimic" width="220" height="54">
+</picture>
 
-<h1>Mimic</h1>
+<br/>
 
 [![CI](https://github.com/LukaG712/Mimic/actions/workflows/ci.yml/badge.svg)](https://github.com/LukaG712/Mimic/actions/workflows/ci.yml)
 [![Node.js](https://img.shields.io/badge/Node.js-18%2B-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
@@ -10,7 +14,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](package.json)
 [![Zero-Dep Server](https://img.shields.io/badge/Clone%20Runtime-Zero--Dependency-0ea5e9)](#local-proxy--deterministic-replay)
 
-**Capture live SPAs, unpack Electron apps, inspect Windows `.exe`/`.msi` binaries, and replay everything offline with deterministic API fixtures and pixel-diff verification.**
+**Capture live SPAs, unpack Electron apps, inspect Windows .exe and .msi binaries, and replay everything offline with deterministic API fixtures and pixel-diff verification.**
 
 [Features](#-core-capabilities) · [Architecture](#-architecture) · [Quick Start](#-quick-start) · [CLI Reference](#-cli-reference) · [Reverse Engineering](#-windows--desktop-reverse-engineering) · [Tests](#-testing)
 

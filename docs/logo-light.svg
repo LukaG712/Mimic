@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 260 64" width="260" height="64" role="img" aria-label="Mimic">
+  <g transform="translate(4, 6)">
+    <rect x="0" y="10" width="42" height="42" rx="10" fill="none" stroke="#94a3b8" stroke-width="2"/>
+    <rect x="12" y="0" width="42" height="42" rx="10" fill="#ffffff" stroke="#0284c7" stroke-width="2"/>
+    <path d="M23 29V13l10 8.5L43 13v16" fill="none" stroke="#0f172a" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+  <text x="74" y="43" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="36" font-weight="700" letter-spacing="-0.8" fill="#0f172a">Mimic</text>
+</svg>
